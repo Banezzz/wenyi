@@ -142,7 +142,6 @@ trans_novel/
   pipeline/     编排器、断点状态、滚动上下文、校验
   postprocess/  标点规范化
   assemble/     EPUB/TXT 回填导出、QA 报告
-prompts/        可选提示词覆盖
 tests/          离线测试
 ```
 
