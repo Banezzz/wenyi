@@ -235,6 +235,102 @@ class TestEpubIngest(unittest.TestCase):
         self.assertEqual(len(doc.chapters), 1)
         self.assertEqual(doc.chapters[0].title, "")
 
+    def test_epub_uses_ncx_toc_label_before_repeated_html_title(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "novel.epub")
+            with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+                zf.writestr(
+                    "META-INF/container.xml",
+                    """<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+<rootfiles><rootfile full-path="content.opf"/></rootfiles>
+</container>""",
+                )
+                zf.writestr(
+                    "content.opf",
+                    """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Intermezzo</dc:title></metadata>
+<manifest>
+<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+<item id="ch1" href="index_split_004.html" media-type="application/xhtml+xml"/>
+</manifest>
+<spine toc="ncx"><itemref idref="ch1"/></spine>
+</package>""",
+                )
+                zf.writestr(
+                    "toc.ncx",
+                    """<?xml version="1.0"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">
+<navMap><navPoint id="n1" playOrder="1">
+<navLabel><text>Chapter 1</text></navLabel>
+<content src="index_split_004.html"/>
+</navPoint></navMap>
+</ncx>""",
+                )
+                zf.writestr(
+                    "index_split_004.html",
+                    """<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Intermezzo</title></head><body><p>1</p><p>Body text.</p></body>
+</html>""",
+                )
+
+            doc = load_document(p, "en", "zh")
+
+        self.assertEqual(len(doc.chapters), 1)
+        self.assertEqual(doc.chapters[0].title, "Chapter 1")
+
+    def test_epub_keeps_toc_entry_for_skipped_title_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "novel.epub")
+            with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+                zf.writestr(
+                    "META-INF/container.xml",
+                    """<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+<rootfiles><rootfile full-path="content.opf"/></rootfiles>
+</container>""",
+                )
+                zf.writestr(
+                    "content.opf",
+                    """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book</dc:title></metadata>
+<manifest>
+<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+<item id="title" href="title.xhtml" media-type="application/xhtml+xml"/>
+<item id="body" href="body.xhtml" media-type="application/xhtml+xml"/>
+</manifest>
+<spine toc="ncx"><itemref idref="title"/><itemref idref="body"/></spine>
+</package>""",
+                )
+                zf.writestr(
+                    "toc.ncx",
+                    """<?xml version="1.0"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">
+<navMap><navPoint id="n1" playOrder="1">
+<navLabel><text>第一章</text></navLabel><content src="title.xhtml"/>
+</navPoint></navMap>
+</ncx>""",
+                )
+                zf.writestr(
+                    "title.xhtml",
+                    """<html xmlns="http://www.w3.org/1999/xhtml"><body><img src="title.jpg"/></body></html>""",
+                )
+                zf.writestr(
+                    "body.xhtml",
+                    """<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Body text.</p></body></html>""",
+                )
+
+            doc = load_document(p, "ja", "zh")
+
+        self.assertEqual(len(doc.chapters), 1)
+        self.assertEqual(doc.chapters[0].href, "body.xhtml")
+        self.assertEqual(doc.chapters[0].title, "")
+        self.assertIn({"href": "title.xhtml", "title": "第一章"}, doc.meta["toc_entries"])
+
 
 if __name__ == "__main__":
     unittest.main()

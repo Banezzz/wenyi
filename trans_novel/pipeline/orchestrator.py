@@ -289,15 +289,30 @@ class Orchestrator:
         chapters = m.get("chapters", [])
 
         # 标题压成单行，避免内嵌换行破坏 numbered 对齐
-        def _flat(s: str) -> str:
-            return " ".join((s or "").split())
+        def _flat(s: object) -> str:
+            return " ".join(str(s or "").split())
+
+        meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+        chapter_hrefs = {c.get("href") for c in chapters if c.get("href")}
+        raw_toc_entries = meta.get("toc_entries", [])
+        toc_entry_items = raw_toc_entries if isinstance(raw_toc_entries, list) else []
+        toc_entries = [
+            e for e in toc_entry_items
+            if isinstance(e, dict) and e.get("href") not in chapter_hrefs and _flat(e.get("title", ""))
+        ]
+
         titled_chapters = [c for c in chapters if _flat(c.get("title", ""))]
         if (m.get("title_translated")
-                and all(c.get("title_translated") for c in titled_chapters)):
+                and all(c.get("title_translated") for c in titled_chapters)
+                and all(e.get("title_translated") for e in toc_entries)):
             store.log_event("titles_skipped", reason="already_translated")
             return  # 已译，断点续跑不重复调用
 
-        titles = [_flat(m.get("title", ""))] + [_flat(c.get("title", "")) for c in titled_chapters]
+        titles = (
+            [_flat(m.get("title", ""))]
+            + [_flat(c.get("title", "")) for c in titled_chapters]
+            + [_flat(e.get("title", "")) for e in toc_entries]
+        )
         if not any(t.strip() for t in titles):
             return
         system = prompts.render("title_translator_system",
@@ -324,8 +339,12 @@ class Orchestrator:
             return
         out = [str(t).strip() for t in out]
         m["title_translated"] = out[0] or m.get("title")
-        for c, t in zip(titled_chapters, out[1:]):
+        chapter_out = out[1:1 + len(titled_chapters)]
+        toc_out = out[1 + len(titled_chapters):]
+        for c, t in zip(titled_chapters, chapter_out):
             c["title_translated"] = t or c.get("title")
+        for e, t in zip(toc_entries, toc_out):
+            e["title_translated"] = t or e.get("title")
         store.save_manifest(m)
         store.log_event(
             "titles_translated",

@@ -168,6 +168,18 @@ def _assemble_epub(store: RunStore, source_path: str, out_path: str) -> str:
         t = _ch_title(c)
         if base and t:
             title_by_base[base] = t
+    meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+    raw_toc_entries = meta.get("toc_entries", [])
+    toc_entries = raw_toc_entries if isinstance(raw_toc_entries, list) else []
+    for entry in toc_entries:
+        if not isinstance(entry, dict):
+            continue
+        href = entry.get("href")
+        title_value = entry.get("title_translated") or entry.get("title")
+        base = _base_no_frag(href if isinstance(href, str) else "")
+        title = title_value.strip() if isinstance(title_value, str) else ""
+        if base and title:
+            title_by_base[base] = title
     book_title = (m.get("title_translated") or "").strip()
 
     with zipfile.ZipFile(source_path, "r") as zin:

@@ -34,17 +34,30 @@ def _find_opf_path(zf: zipfile.ZipFile) -> str:
     raise ValueError("EPUB 损坏：container.xml 未找到 rootfile")
 
 
-def _parse_opf(zf: zipfile.ZipFile, opf_path: str) -> tuple[str, list[str]]:
-    """返回 (书名, spine 顺序的 XHTML zip 路径列表)。"""
+def _zip_href(base_path: str, href: str) -> str:
+    """Resolve an EPUB-relative href to a normalized zip member path."""
+    clean = (href or "").split("#", 1)[0]
+    if not clean:
+        return ""
+    base_dir = posixpath.dirname(base_path)
+    return posixpath.normpath(posixpath.join(base_dir, clean)) if base_dir else clean
+
+
+def _attr_str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _parse_opf(zf: zipfile.ZipFile, opf_path: str) -> tuple[str, list[str], list[str]]:
+    """返回 (书名, spine 顺序的 XHTML zip 路径列表, TOC/NAV 文件路径列表)。"""
     root = ET.fromstring(zf.read(opf_path))
-    opf_dir = posixpath.dirname(opf_path)
 
     def local(tag: str) -> str:
         return tag.rsplit("}", 1)[-1]
 
     title = ""
-    manifest: dict[str, tuple[str, str]] = {}  # id -> (href, media-type)
+    manifest: dict[str, tuple[str, str, str]] = {}  # id -> (href, media-type, properties)
     spine_ids: list[str] = []
+    toc_ids: list[str] = []
 
     for el in root.iter():
         name = local(el.tag)
@@ -54,28 +67,89 @@ def _parse_opf(zf: zipfile.ZipFile, opf_path: str) -> tuple[str, list[str]]:
             manifest[el.attrib["id"]] = (
                 el.attrib.get("href", ""),
                 el.attrib.get("media-type", ""),
+                el.attrib.get("properties", ""),
             )
         elif name == "itemref":
             spine_ids.append(el.attrib["idref"])
+        elif name == "spine":
+            toc = el.attrib.get("toc")
+            if toc:
+                toc_ids.append(toc)
 
     hrefs: list[str] = []
     for sid in spine_ids:
         if sid not in manifest:
             continue
-        href, media = manifest[sid]
+        href, media, _props = manifest[sid]
         if "html" not in media and not href.endswith((".xhtml", ".html", ".htm")):
             continue
-        full = posixpath.normpath(posixpath.join(opf_dir, href)) if opf_dir else href
-        hrefs.append(full)
-    return title, hrefs
+        hrefs.append(_zip_href(opf_path, href))
+
+    toc_paths: list[str] = []
+    for item_id, (href, media, props) in manifest.items():
+        if item_id in toc_ids or "nav" in props.split() or media == "application/x-dtbncx+xml":
+            toc_paths.append(_zip_href(opf_path, href))
+    return title, hrefs, toc_paths
 
 
-def _looks_like_internal_title(title: str, href: str) -> bool:
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _toc_label_map(zf: zipfile.ZipFile, toc_paths: list[str]) -> dict[str, str]:
+    """Return zip href -> first TOC label from NCX/NAV documents."""
+    labels: dict[str, str] = {}
+    names = set(zf.namelist())
+    for toc_path in toc_paths:
+        if toc_path not in names:
+            continue
+        data = zf.read(toc_path)
+        if toc_path.lower().endswith(".ncx"):
+            root = ET.fromstring(data)
+            for nav_point in root.iter():
+                if _local(nav_point.tag) != "navPoint":
+                    continue
+                label = ""
+                src = ""
+                for child in nav_point.iter():
+                    name = _local(child.tag)
+                    if name == "text" and child.text and not label:
+                        label = child.text.strip()
+                    elif name == "content" and not src:
+                        src = child.attrib.get("src", "")
+                href = _zip_href(toc_path, src)
+                if href and label and href not in labels:
+                    labels[href] = label
+            continue
+
+        soup = BeautifulSoup(data, "html.parser")
+        toc_navs = [
+            n for n in soup.find_all("nav")
+            if "toc" in (_attr_str(n.get("epub:type")) or _attr_str(n.get("type"))).split()
+        ]
+        for nav in toc_navs or [soup]:
+            for a in nav.find_all("a", href=True):
+                label = a.get_text(" ", strip=True)
+                href = _zip_href(toc_path, _attr_str(a.get("href")))
+                if href and label and href not in labels:
+                    labels[href] = label
+    return labels
+
+
+def _looks_like_internal_title(title: str, href: str, book_title: str = "") -> bool:
     base = posixpath.basename(href).rsplit(".", 1)[0]
-    return bool(base) and title.strip() == base
+    stripped = title.strip()
+    return (bool(base) and stripped == base) or (bool(book_title) and stripped == book_title.strip())
 
 
-def _extract_chapter(html: str, chapter_index: int, href: str) -> tuple[str, list[Segment], str]:
+def _extract_chapter(
+    html: str,
+    chapter_index: int,
+    href: str,
+    *,
+    book_title: str = "",
+    toc_title: str = "",
+) -> tuple[str, list[Segment], str]:
     """解析单个 XHTML 文档，返回 (标题, segments, 带标记的模板 HTML)。"""
     soup = BeautifulSoup(html, "html.parser")
     segments: list[Segment] = []
@@ -93,17 +167,18 @@ def _extract_chapter(html: str, chapter_index: int, href: str) -> tuple[str, lis
         segments.append(Segment(index=idx, source=text, kind=kind, anchor=anchor))
         idx += 1
 
-    # 标题：首个 heading 文本 → 非内部文件名的 <title> → 无标题。
+    # 标题：官方 TOC → 首个 heading 文本 → 非内部文件名/书名的 <title> → 无标题。
     # 一些 EPUB 把 XHTML 文件名写进 <title>，如 cUH.xhtml 的 <title>cUH</title>，
-    # 这不是读者可见章节标题，不能进入目录或标题翻译。
-    title = ""
-    for s in segments:
-        if s.kind == KIND_HEADING:
-            title = s.source
-            break
+    # 或把全书书名写进每个 <title>，这不是读者可见章节标题，不能进入目录或标题翻译。
+    title = toc_title.strip()
+    if not title:
+        for s in segments:
+            if s.kind == KIND_HEADING:
+                title = s.source
+                break
     if not title and soup.title and soup.title.string:
         candidate = soup.title.string.strip()
-        if not _looks_like_internal_title(candidate, href):
+        if not _looks_like_internal_title(candidate, href, book_title):
             title = candidate
 
     return title, segments, str(soup)
@@ -113,7 +188,13 @@ def read_epub(path: str, source_lang: str, target_lang: str) -> Document:
     with zipfile.ZipFile(path, "r") as zf:
         names = set(zf.namelist())
         opf_path = _find_opf_path(zf)
-        book_title, hrefs = _parse_opf(zf, opf_path)
+        book_title, hrefs, toc_paths = _parse_opf(zf, opf_path)
+        toc_titles = _toc_label_map(zf, toc_paths)
+        toc_entries = [
+            {"href": href, "title": title}
+            for href, title in toc_titles.items()
+            if href and title
+        ]
 
         chapters: list[Chapter] = []
         ci = 0
@@ -121,7 +202,9 @@ def read_epub(path: str, source_lang: str, target_lang: str) -> Document:
             if href not in names:
                 continue
             html = zf.read(href).decode("utf-8", errors="replace")
-            title, segments, template = _extract_chapter(html, ci, href)
+            title, segments, template = _extract_chapter(
+                html, ci, href, book_title=book_title, toc_title=toc_titles.get(href, "")
+            )
             if not any(s.source.strip() for s in segments):
                 continue  # 无正文（封面/版权页等）→ writer 原样拷贝，不作为章节
             chapters.append(
@@ -142,5 +225,5 @@ def read_epub(path: str, source_lang: str, target_lang: str) -> Document:
         fmt="epub",
         source_path=os.path.abspath(path),
         chapters=chapters,
-        meta={"opf_path": opf_path},
+        meta={"opf_path": opf_path, "toc_paths": toc_paths, "toc_entries": toc_entries},
     )
