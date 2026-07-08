@@ -1,13 +1,13 @@
 """LLM 抽象接口与具体实现。
 
 设计要点：
-- 三档 tier："strong"（deepseek-v4-pro + thinking，翻译/润色/分析/审计）、
-  "cheap"（deepseek-v4-flash + thinking，审校/一致性等判断类）、
-  "fast"（deepseek-v4-flash 免思考，梗概/术语抽取/回译等机械任务——
-  thinking 推理 token 按输出计费，机械任务关掉可大幅省钱提速）。
+- 三档 tier："strong"（高质量翻译/润色/分析/审计）、
+  "cheap"（审校/一致性等判断类）、
+  "fast"（梗概/术语抽取/回译等机械任务）。
   缺档时按回退链向"更便宜优先"回退（fast→cheap→strong），老双档配置行为不变。
 - complete() 返回纯文本；complete_json() 强制 JSON 输出并 loose 解析。
 - DeepSeekClient 经由 OpenAI SDK 调 https://api.deepseek.com，openai 惰性导入；
+- LongCatClient 经由 OpenAI SDK 调 https://api.longcat.chat/openai/v1；
   未装 openai 时仍可用 FakeClient 跑通离线流程（切分/对齐/术语库/状态机）。
 """
 
@@ -63,15 +63,17 @@ def parse_json_loose(text: str) -> Any:
             return json.loads(inner)
         except Exception:
             text = inner
-    # 截取首个 JSON 数组或对象
-    for open_ch, close_ch in (("[", "]"), ("{", "}")):
-        start = text.find(open_ch)
-        end = text.rfind(close_ch)
-        if start != -1 and end > start:
-            try:
-                return json.loads(text[start : end + 1])
-            except Exception:
-                continue
+
+    # 从任意 { 或 [ 开始尝试 raw_decode，避开正文里的非 JSON 方括号。
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            data, _end = decoder.raw_decode(text[i:])
+            return data
+        except json.JSONDecodeError:
+            continue
     raise ValueError(f"无法解析为 JSON：{text[:200]!r}")
 
 
@@ -176,6 +178,80 @@ class DeepSeekClient(LLMClient):
         return _call()
 
 
+class LongCatClient(LLMClient):
+    """LongCat OpenAI-compatible client.
+
+    LongCat 支持 OpenAI Chat Completions 形态，但 thinking 是顶层扩展参数；
+    文档未声明 response_format，因此 JSON 模式只依赖提示词约束和本地宽松解析。
+    """
+
+    def __init__(self, cfg: LLMConfig):
+        self.cfg = cfg
+        if not cfg.tiers:
+            raise ValueError("配置缺少 llm.tiers")
+        self._client = None
+        self._client_lock = threading.Lock()
+
+    def _ensure_client(self):
+        with self._client_lock:
+            if self._client is None:
+                try:
+                    from openai import OpenAI
+                except ImportError as e:  # pragma: no cover
+                    raise RuntimeError(
+                        "需要 openai SDK：pip install openai（或把 llm.provider 设为 fake 做离线测试）"
+                    ) from e
+                api_key = self.cfg.api_key
+                if not api_key:
+                    raise RuntimeError(
+                        f"未设置环境变量 {self.cfg.api_key_env}（LongCat API key）"
+                    )
+                self._client = OpenAI(
+                    api_key=api_key,
+                    base_url=self.cfg.base_url,
+                    timeout=self.cfg.timeout,
+                )
+            return self._client
+
+    def complete(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        json_mode: bool = False,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        tcfg = resolve_tier(self.cfg.tiers, tier)
+        client = self._ensure_client()
+
+        kwargs: dict[str, Any] = {
+            "model": tcfg.model,
+            "messages": messages,
+            "stream": False,
+            "extra_body": {
+                "thinking": (
+                    {"type": "enabled", "effort": tcfg.reasoning_effort}
+                    if tcfg.thinking
+                    else {"type": "disabled"}
+                )
+            },
+        }
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+
+        @retry(
+            stop=stop_after_attempt(self.cfg.max_retries + 1),
+            wait=wait_exponential(multiplier=1, max=30),
+            retry=retry_if_exception_type(Exception),
+            reraise=True,
+        )
+        def _call() -> str:
+            resp = client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content or ""
+
+        return _call()
+
+
 # ── 离线 Fake（测试 / 不发网络请求）───────────────────────────────────────
 class FakeClient(LLMClient):
     """可编程的离线 client。
@@ -207,6 +283,8 @@ def build_client(config: Config) -> LLMClient:
     provider = config.llm.provider.lower()
     if provider == "deepseek":
         return DeepSeekClient(config.llm)
+    if provider == "longcat":
+        return LongCatClient(config.llm)
     if provider == "fake":
         return FakeClient()
-    raise ValueError(f"未知 provider：{provider}（支持 deepseek / fake）")
+    raise ValueError(f"未知 provider：{provider}（支持 longcat / deepseek / fake）")

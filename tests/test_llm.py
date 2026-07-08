@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 
+from trans_novel.config import Config
 from trans_novel.llm.base import FakeClient, parse_json_loose
 
 
@@ -17,6 +19,10 @@ class TestParseJsonLoose(unittest.TestCase):
     def test_surrounded_by_prose(self):
         text = '思考结束。结果如下：["译文1","译文2"] 完毕。'
         self.assertEqual(parse_json_loose(text), ["译文1", "译文2"])
+
+    def test_ignores_non_json_brackets_before_payload(self):
+        text = '说明：[不是 JSON]。真正结果：{"issues":[]}'
+        self.assertEqual(parse_json_loose(text), {"issues": []})
 
     def test_failure(self):
         with self.assertRaises(ValueError):
@@ -46,6 +52,69 @@ class TestResolveTier(unittest.TestCase):
         self.assertIs(resolve_tier(tiers3, "cheap"), strong)
         # 未知档 → 落 strong
         self.assertIs(resolve_tier(tiers, "unknown"), strong)
+
+
+class TestLongCatClient(unittest.TestCase):
+    def _client(self):
+        from trans_novel.llm.base import LongCatClient
+
+        cfg = Config.from_dict({
+            "llm": {
+                "provider": "longcat",
+                "base_url": "https://api.longcat.chat/openai/v1",
+                "api_key_env": "LONGCAT_API_KEY",
+                "tiers": {
+                    "strong": {
+                        "model": "LongCat-2.0",
+                        "reasoning_effort": "high",
+                        "thinking": True,
+                    },
+                    "fast": {"model": "LongCat-2.0", "thinking": False},
+                },
+            }
+        })
+        return LongCatClient(cfg.llm)
+
+    def test_thinking_effort_is_sent_for_enabled_tier(self):
+        captured = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+                )
+
+        client = self._client()
+        client._client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+        out = client.complete([{"role": "user", "content": "x"}], tier="strong")
+        self.assertEqual(out, "ok")
+        self.assertEqual(
+            captured["extra_body"]["thinking"],
+            {"type": "enabled", "effort": "high"},
+        )
+
+    def test_thinking_disabled_for_fast_tier(self):
+        captured = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+                )
+
+        client = self._client()
+        client._client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+        client.complete([{"role": "user", "content": "x"}], tier="fast")
+        self.assertEqual(
+            captured["extra_body"]["thinking"],
+            {"type": "disabled"},
+        )
 
 
 class TestFakeClient(unittest.TestCase):
