@@ -22,6 +22,7 @@ class Analyzer(Agent):
         data = self._ask_json(system, user, tier="strong")
         if not isinstance(data, dict):
             data = {}
+        data.setdefault("content_type", "")
         data.setdefault("genre", "")
         data.setdefault("tone", "")
         data.setdefault("style_guide", "")
@@ -64,6 +65,8 @@ class Analyzer(Agent):
     def style_brief(self, analysis: dict[str, Any]) -> str:
         """把分析结果浓缩成给译者注入的风格/角色简报。"""
         lines = []
+        if analysis.get("content_type"):
+            lines.append(f"文本类型：{analysis['content_type']}")
         if analysis.get("genre"):
             lines.append(f"体裁：{analysis['genre']}")
         if analysis.get("tone"):
