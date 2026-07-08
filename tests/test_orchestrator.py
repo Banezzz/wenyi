@@ -11,7 +11,7 @@ import unittest
 from trans_novel.config import Config
 from trans_novel.llm.base import FakeClient
 from trans_novel.pipeline.orchestrator import Orchestrator, _normalize_lang
-from trans_novel.pipeline.runstore import STATUS_DONE, STATUS_PENDING
+from trans_novel.pipeline.runstore import RunStore, STATUS_DONE, STATUS_PENDING, slugify
 from tests.sample_data import write_sample_txt
 from tests.fake_llm import routing_handler
 
@@ -95,6 +95,52 @@ class TestOrchestrator(unittest.TestCase):
             store2 = orch2.run(txt)
             m2 = store2.load_manifest()
             self.assertTrue(all(c["status"] == STATUS_DONE for c in m2["chapters"]))
+
+    def test_prepare_continues_when_analysis_returns_non_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+
+            def handler(messages, tier, json_mode):
+                if "前期分析师" in messages[0]["content"]:
+                    return "你好，我无法给到相关内容。"
+                return routing_handler(messages, tier, json_mode)
+
+            store = Orchestrator(cfg, client=FakeClient(handler=handler)).prepare(txt)
+            self.assertEqual(store.load_analysis(), {})
+            self.assertEqual(store.load_context(), {"recent_targets": []})
+            with open(store.event_log_path, "r", encoding="utf-8") as f:
+                events = [json.loads(line) for line in f if line.strip()]
+            names = [e["event"] for e in events]
+            self.assertIn("analysis_failed", names)
+            self.assertIn("analysis_saved", names)
+
+    def test_prepare_repairs_existing_run_missing_analysis_and_context(self):
+        from trans_novel.ingest.segmenter import load_document
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            doc = load_document(txt, "ja", "zh")
+            run_dir = os.path.join(cfg.state_dir, slugify(doc.title))
+            store = RunStore(run_dir)
+            store.init_from_document(doc)
+            self.assertFalse(os.path.exists(store.analysis_path))
+            self.assertFalse(os.path.exists(store.context_path))
+
+            repaired = Orchestrator(
+                cfg,
+                client=FakeClient(handler=routing_handler),
+            ).prepare(txt)
+
+            self.assertTrue(os.path.exists(repaired.analysis_path))
+            self.assertTrue(os.path.exists(repaired.context_path))
+            self.assertTrue((repaired.load_analysis() or {}).get("genre"))
+            with open(repaired.event_log_path, "r", encoding="utf-8") as f:
+                events = [json.loads(line) for line in f if line.strip()]
+            self.assertIn("analysis_repaired", [e["event"] for e in events])
 
 
 class TestSegmentLevelResume(unittest.TestCase):
@@ -319,6 +365,32 @@ class TestReviewReporting(unittest.TestCase):
             # 每块报 index 0 → 映射后应为各块首段的章内段号（0,1,2,...互不相同）
             self.assertEqual(idxs, list(range(len(ch.text_segments))))
 
+    def test_length_issues_survive_chapter_review(self):
+        """批次廉价长度问题不能被章末 review 覆盖掉。"""
+        def handler(messages, tier, json_mode):
+            system = messages[0]["content"]
+            user = messages[-1]["content"]
+            if "文学翻译" in system:
+                n = len(re.findall(r"^\[(\d+)\]", user, re.M))
+                return json.dumps({"translations": ["" for _ in range(n)]},
+                                  ensure_ascii=False)
+            if "译文审校" in system:
+                return json.dumps({"issues": [
+                    {"index": 0, "type": "missing", "detail": "漏译", "suggestion": "补译"}
+                ]}, ensure_ascii=False)
+            return routing_handler(messages, tier, json_mode)
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt"); write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.polish = False
+            cfg.pipeline.autofix_severe = False
+            cfg.pipeline.book_understanding = False
+            store = Orchestrator(cfg, client=FakeClient(handler=handler)).run(txt)
+            issues = store.load_chapter(0).meta["review_issues"]
+            self.assertTrue(any(i.get("stage") == "length" for i in issues))
+            self.assertTrue(any(i.get("stage") == "review" for i in issues))
+
 
 class TestStyleAnalysis(unittest.TestCase):
     def _long_doc(self, d):
@@ -356,6 +428,34 @@ class TestStyleAnalysis(unittest.TestCase):
             self.assertEqual(sample.count("【开头样章】"), 1)
             self.assertNotIn("【中部样章】", sample)
             self.assertNotIn("【结尾样章】", sample)
+
+    def test_sample_text_skips_front_matter(self):
+        from trans_novel.ingest.models import Chapter, Document, Segment
+
+        copyright_text = "Copyright © 2015. All rights reserved. ISBN: 1." + "x" * 260
+        chapter_text = "Financial contracts define obligations and payoffs. " + "y" * 260
+        doc = Document(
+            title="Book",
+            source_lang="en",
+            target_lang="zh",
+            fmt="epub",
+            chapters=[
+                Chapter(
+                    index=0,
+                    title="Copyright Page",
+                    segments=[Segment(index=0, source=copyright_text)],
+                ),
+                Chapter(
+                    index=1,
+                    title="1 Financial Contracts",
+                    segments=[Segment(index=0, source=chapter_text)],
+                ),
+            ],
+        )
+
+        sample = Orchestrator._sample_text(doc)
+        self.assertIn("Financial contracts", sample)
+        self.assertNotIn("Copyright ©", sample)
 
     def test_style_brief_new_fields(self):
         """style_brief 渲染新风格维度；旧 analysis（缺新字段）不报错不输出。"""

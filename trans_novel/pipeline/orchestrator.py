@@ -51,6 +51,21 @@ _LANG_ALIASES = {
     "portuguese": "pt", "葡萄牙语": "pt", "葡萄牙文": "pt",
 }
 
+_FRONT_MATTER_TITLE_PATTERNS = (
+    "cover",
+    "copyright",
+    "title page",
+    "contents",
+    "table of contents",
+    "dedication",
+    "acknowledgments",
+    "acknowledgements",
+    "about the author",
+    "bibliography",
+    "references",
+    "index",
+)
+
 
 def _normalize_lang(code: str) -> str:
     c = (code or "").strip().lower()
@@ -97,6 +112,9 @@ class Orchestrator:
         run_dir = os.path.join(self.config.state_dir, slugify(doc.title))
         store = RunStore(run_dir)
         if store.exists():
+            manifest = store.load_manifest()
+            self._apply_language(manifest.get("source_lang") or self.config.source_lang)
+            self._repair_existing_run(store, input_path)
             store.log_event("run_resumed", input_path=input_path, run_dir=store.run_dir)
             return store  # 已有进度 → 直接续跑，不重置（语言在 run() 里按 manifest 应用）
 
@@ -133,15 +151,52 @@ class Orchestrator:
             },
         )
         glossary = GlossaryStore(store.glossary_path)
-        sample = self._sample_text(doc)
-        analysis = self.analyzer.analyze(sample) if sample else {}
-        if analysis:
-            self.analyzer.seed_glossary(glossary, analysis)
-        store.save_analysis(analysis)
-        store.log_event("analysis_saved", has_analysis=bool(analysis))
-        glossary.close()
+        analysis: dict[str, Any] = {}
+        try:
+            sample = self._sample_text(doc)
+            analysis = self.analyzer.analyze(sample) if sample else {}
+            if analysis:
+                self.analyzer.seed_glossary(glossary, analysis)
+        except Exception as exc:
+            # 前期分析是质量增强，不应因模型拒答/非 JSON 输出阻断整本书翻译。
+            analysis = {}
+            store.log_event("analysis_failed", error=str(exc)[:500])
+        finally:
+            store.save_analysis(analysis)
+            store.log_event("analysis_saved", has_analysis=bool(analysis))
+            glossary.close()
         store.save_context(RollingContext().to_dict())
         return store
+
+    def _repair_existing_run(self, store: RunStore, input_path: str) -> None:
+        """补齐早期中断留下的缺失产物，不重置已有章节译文和 manifest。"""
+        if not os.path.isfile(store.context_path):
+            store.save_context(RollingContext().to_dict())
+            store.log_event("context_repaired", reason="missing")
+
+        if os.path.isfile(store.analysis_path):
+            return
+
+        analysis: dict[str, Any] = {}
+        glossary = GlossaryStore(store.glossary_path)
+        try:
+            doc = load_document(
+                input_path,
+                self.config.source_lang,
+                self.config.target_lang,
+                split_segments=self.config.segment.max_chars_per_segment,
+            )
+            sample = self._sample_text(doc)
+            analysis = self.analyzer.analyze(sample) if sample else {}
+            if analysis:
+                self.analyzer.seed_glossary(glossary, analysis)
+        except Exception as exc:
+            analysis = {}
+            store.log_event("analysis_failed", phase="repair", error=str(exc)[:500])
+        finally:
+            glossary.close()
+            store.save_analysis(analysis)
+            store.log_event("analysis_repaired", has_analysis=bool(analysis))
 
     def _detect_language_ai(self, doc) -> str:
         """用模型检测正文主要语言，返回 ISO 代码（如 ja/en/ru）。失败返回空串。"""
@@ -167,8 +222,22 @@ class Orchestrator:
     def _sample_text(doc, *, labeled: bool = True) -> str:
         """取风格分析样章。labeled=True 时多点采样（开头/中部/结尾各一段，带中文标注），
         让分析覆盖全书风格全貌；labeled=False 返回单段纯源文（语言检测用，不能混入中文标签）。"""
-        texts = ["\n".join(s.source for s in ch.text_segments) for ch in doc.chapters]
-        texts = [t for t in texts if len(t) > 200]
+        def _chapter_texts(*, include_front_matter: bool) -> list[str]:
+            out: list[str] = []
+            for ch in doc.chapters:
+                text = "\n".join(s.source for s in ch.text_segments)
+                if len(text) <= 200:
+                    continue
+                if not include_front_matter and Orchestrator._looks_front_matter(
+                    ch.title, text
+                ):
+                    continue
+                out.append(text)
+            return out
+
+        texts = _chapter_texts(include_front_matter=False)
+        if not texts:
+            texts = _chapter_texts(include_front_matter=True)
         if not texts:  # 兜底：全书都是短章
             joined = "\n".join(
                 s.source for ch in doc.chapters[:2] for s in ch.text_segments)
@@ -186,6 +255,20 @@ class Orchestrator:
             chunk = t[-2800:] if tag == "结尾样章" else t[:2800]
             parts.append(f"【{tag}】\n{chunk}")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _looks_front_matter(title: str, text: str) -> bool:
+        """分析采样避开版权页/目录页等前置材料，减少模型拒答和风格误判。"""
+        title_l = (title or "").strip().lower()
+        if any(p in title_l for p in _FRONT_MATTER_TITLE_PATTERNS):
+            return True
+        head = (text or "")[:400].lower()
+        return (
+            "copyright ©" in head
+            or "all rights reserved" in head
+            or "isbn:" in head
+            or "table of contents" in head
+        )
 
     def run(self, input_path: str, *, only_chapter: int | None = None,
             progress: Optional[ProgressFn] = None) -> RunStore:
@@ -251,8 +334,14 @@ class Orchestrator:
         # 保持原子写不竞争，且逐章增量落盘、续跑粒度不变）。已有梗概的章跳过（幂等）。
         loaded = {c.get("index", i): store.load_chapter(c.get("index", i))
                   for i, c in enumerate(chapters)}
-        todo = [(ci, "\n".join(s.source for s in ch.text_segments))
-                for ci, ch in loaded.items() if not ch.meta.get("source_digest")]
+        todo = []
+        for ci, ch in loaded.items():
+            if ch.meta.get("source_digest"):
+                continue
+            src = "\n".join(s.source for s in ch.text_segments)
+            if self._looks_front_matter(ch.title, src):
+                continue
+            todo.append((ci, src))
         if todo:
             store.log_event(
                 "book_understanding_chapter_digest_started",
@@ -337,7 +426,12 @@ class Orchestrator:
             data = self.client.complete_json(
                 [{"role": "system", "content": system},
                  {"role": "user", "content": user}], tier="strong")
-        except Exception:
+        except Exception as exc:
+            store.log_event(
+                "titles_translation_failed",
+                reason="exception",
+                error=str(exc),
+            )
             return
         out = data.get("titles") if isinstance(data, dict) else data
         if not isinstance(out, list) or len(out) != len(titles):
@@ -389,7 +483,7 @@ class Orchestrator:
         # 断点续跑（段/批级）：上次中断前已译完并落盘的批次，整批跳过、不重翻，只重建上下文。
         review_issues: list[dict] = [
             i for i in chapter.meta.get("review_issues", [])
-            if i.get("stage") != "length"
+            if i.get("stage") != "review"
         ]
         bt_samples: list[tuple[str, str]] = []
         seg_base = 0   # 当前批首段的章内段号（issue 批内下标 → 章内段号）
@@ -466,7 +560,10 @@ class Orchestrator:
         # ── 章末整章审校（移出批内关键路径；块内 index 映射回章内段号）──
         # 幂等：续跑重入章末时清掉旧审校项，防重复累积。
         if self.config.pipeline.review:
-            review_issues = []
+            review_issues = [
+                i for i in review_issues
+                if i.get("stage") != "review"
+            ]
             new_issues = self._review_chapter(text_segs, term_snapshot)
             store.log_event(
                 "chapter_reviewed",
@@ -651,8 +748,6 @@ class Orchestrator:
             sources, glossary_terms=terms, style=style, context=ctx_text,
             book_synopsis=book_synopsis, chapter_digest=chapter_digest)
 
-        issues: list[dict] = []
-
         if self.config.pipeline.polish:
             polished = self.polisher.polish(targets, glossary_terms=terms, style=style)
             if len(polished) == len(targets):
@@ -660,6 +755,17 @@ class Orchestrator:
 
         if self.config.punctuation_normalize:
             targets = [normalize_zh(t) if t else t for t in targets]
+
+        issues: list[dict] = []
+        for flag in checks.length_flags(sources, targets):
+            issues.append({
+                "index": flag.index,
+                "type": "length",
+                "stage": "length",
+                "reason": flag.reason,
+                "ratio": flag.ratio,
+                "detail": f"译文长度异常：{flag.reason}，译文/原文字符比 {flag.ratio:.2f}",
+            })
 
         bt_samples: list[tuple[str, str]] = []
         rate = self.config.pipeline.backtranslate_sample
