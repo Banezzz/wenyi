@@ -65,6 +65,22 @@ class TestBackTranslator(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0]["index"], 1)
 
+    def test_backtranslation_alignment_failure_is_reported(self):
+        def handler(messages, tier, json_mode):
+            system = messages[0]["content"]
+            if "回译译者" in system:
+                return json.dumps({"backtranslations": ["あ"]}, ensure_ascii=False)
+            if "保真度" in system:
+                self.fail("对齐失败时不应继续语义比对")
+            return "{}"
+
+        bt = BackTranslator(FakeClient(handler=handler), _cfg())
+        issues = bt.check(["あ", "い"], ["甲", "乙"])
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["type"], "backtranslation_alignment")
+        self.assertEqual(issues[0]["expected"], 2)
+        self.assertEqual(issues[0]["actual"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

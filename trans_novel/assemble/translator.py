@@ -56,6 +56,17 @@ class Translator(Agent):
                                book_synopsis, chapter_digest)
         return out[0] if out else ""
 
+    def _translate_one_safe(self, source, glossary_terms, style, context,
+                            book_synopsis, chapter_digest) -> str:
+        """逐段兜底不能再向外抛错；失败留空，交由廉价校验/报告暴露。"""
+        try:
+            return self._translate_one(
+                source, glossary_terms, style, context,
+                book_synopsis, chapter_digest,
+            )
+        except Exception:
+            return ""
+
     def retranslate_with_feedback(
         self,
         source: str,
@@ -121,5 +132,9 @@ class Translator(Agent):
             if len(out) == n:
                 return out
         # 兜底：逐段翻译，保证 1:1
-        return [self._translate_one(s, glossary_terms, style, context,
-                                    book_synopsis, chapter_digest) for s in sources]
+        return [
+            self._translate_one_safe(
+                s, glossary_terms, style, context, book_synopsis, chapter_digest
+            )
+            for s in sources
+        ]

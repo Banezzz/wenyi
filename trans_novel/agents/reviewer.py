@@ -53,9 +53,22 @@ class BackTranslator(Agent):
 
     def check(self, sources: list[str], targets: list[str]) -> list[dict[str, Any]]:
         """对给定（已抽样的）段做回译并比对，返回偏离问题。index 为传入列表内的下标。"""
-        back = self.backtranslate(targets)
+        if not sources:
+            return []
+        back: list[str] = []
+        attempts = max(1, self.config.pipeline.align_retry_limit + 1)
+        for _ in range(attempts):
+            back = self.backtranslate(targets)
+            if len(back) == len(sources):
+                break
         if len(back) != len(sources):
-            return []  # 回译对齐失败则跳过，不阻塞
+            return [{
+                "index": None,
+                "type": "backtranslation_alignment",
+                "detail": f"回译段数对齐失败：期望 {len(sources)} 段，实际 {len(back)} 段，已跳过语义比对",
+                "expected": len(sources),
+                "actual": len(back),
+            }]
         pairs = "\n".join(
             f"[{i}] 原文：{s}\n    回译：{b}" for i, (s, b) in enumerate(zip(sources, back))
         )

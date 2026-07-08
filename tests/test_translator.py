@@ -56,6 +56,14 @@ class TestTranslatorAlignment(unittest.TestCase):
                         if _count_segments(c["messages"][-1]["content"]) == 1]
         self.assertGreaterEqual(len(single_calls), 3)
 
+    def test_per_segment_fallback_keeps_alignment_when_single_call_fails(self):
+        def handler(messages, tier, json_mode):
+            raise RuntimeError("model down")
+
+        t = Translator(FakeClient(handler=handler), self._config())
+        out = t.translate_batch(["あ", "い"])
+        self.assertEqual(out, ["", ""])
+
 
 class TestChecks(unittest.TestCase):
     def test_count_aligned(self):

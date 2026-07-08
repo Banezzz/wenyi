@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,8 @@ TYPE_ONOMATOPOEIA = "拟声词"
 _SOURCE_ONLY_TYPES = {TYPE_APPELLATION, TYPE_HONORIFIC, TYPE_SPEECH, TYPE_FIXED_EXPR}
 
 CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
+_HAN_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+_LATIN_WORD_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 @dataclass
@@ -217,6 +220,23 @@ class GlossaryStore:
         return [GlossaryTerm.from_row(r) for r in rows]
 
     @staticmethod
+    def _contains_key(text: str, key: str) -> bool:
+        """术语命中：避免短词在普通词内部误命中，同时保留日文助词场景。"""
+        if not key:
+            return False
+        if _LATIN_WORD_RE.fullmatch(key):
+            return re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])",
+                text,
+            ) is not None
+        if len(key) == 1 and _HAN_RE.fullmatch(key):
+            return re.search(
+                rf"(?<![\u3400-\u9fff\uf900-\ufaff]){re.escape(key)}(?![\u3400-\u9fff\uf900-\ufaff])",
+                text,
+            ) is not None
+        return key in text
+
+    @staticmethod
     def terms_in(terms: list[GlossaryTerm], text: str) -> list[GlossaryTerm]:
         """从给定术语列表里筛出 source 或任一别名在 text 中出现的项。
 
@@ -231,7 +251,7 @@ class GlossaryStore:
                 if term.type in _SOURCE_ONLY_TYPES
                 else [term.source] + term.aliases
             )
-            if any(k and k in text for k in keys):
+            if any(GlossaryStore._contains_key(text, k) for k in keys):
                 out.append(term)
         return out
 

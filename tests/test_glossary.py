@@ -43,6 +43,13 @@ class TestGlossary(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].source, "綾小路")
 
+    def test_single_han_term_does_not_match_inside_word(self):
+        self.store.upsert_term(GlossaryTerm(source="李", target="李", type=TYPE_PERSON))
+        self.assertEqual(self.store.terms_in_text("行李放在门口。"), [])
+        hits = self.store.terms_in_text("李さんは窓の外を見た。")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].source, "李")
+
     def test_appellation_does_not_match_bare_name_alias(self):
         self.store.upsert_term(
             GlossaryTerm(

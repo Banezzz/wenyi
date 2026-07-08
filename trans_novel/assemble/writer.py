@@ -151,7 +151,6 @@ def _rewrite_opf_metadata(
         return soup.encode()
     except Exception:
         return data
-    return data
 
 
 def _epub_looks_vertical(zf: zipfile.ZipFile) -> bool:
