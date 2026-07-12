@@ -165,7 +165,7 @@ class TestTitleTranslation(unittest.TestCase):
             g.close()
             m2 = store.load_manifest()
             self.assertNotIn("title_translated", m2)                    # 书名译名字段被清理
-            self.assertEqual(m2["chapters"][0]["title_translated"], "佳穗登场")  # 章名已规范
+            self.assertEqual(m2["chapters"][0]["title_translated"], "佳穗登场")  # 仅标题替换可直接保留
 
     def test_rewrite_nav_and_ncx_labels(self):
         from trans_novel.assemble.writer import _rewrite_toc
@@ -185,6 +185,30 @@ class TestTitleTranslation(unittest.TestCase):
         self.assertIn("第一章译名", dec)
         self.assertNotIn(">old<", dec)
 
+    def test_non_string_title_items_fall_back_to_source_titles(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+
+            def handler(messages, tier, json_mode):
+                if "标题翻译专家" in messages[0]["content"]:
+                    return json.dumps(
+                        {"titles": [None, {"bad": True}]},
+                        ensure_ascii=False,
+                    )
+                return routing_handler(messages, tier, json_mode)
+
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=handler)
+            ).run(txt)
+            manifest = store.load_manifest()
+            self.assertEqual(manifest["titles_status"], "done")
+            self.assertTrue(all(
+                chapter["title_translated"] == " ".join(chapter["title"].split())
+                for chapter in manifest["chapters"]
+            ))
+
 
 class TestReport(unittest.TestCase):
     def test_report_summary(self):
@@ -197,8 +221,20 @@ class TestReport(unittest.TestCase):
             g.close()
             s = report["summary"]
             self.assertEqual(s["chapters_done"], s["chapters_total"])
+            self.assertEqual(s["glossary_pending"], 0)
+            self.assertFalse(s["titles_pending"])
             self.assertEqual(s["empty_targets"], 0)  # 全部段都有译文
             self.assertGreaterEqual(s["terms"], 1)
+
+            manifest = store.load_manifest()
+            manifest["chapters"][0]["glossary_status"] = "pending"
+            manifest["titles_status"] = "pending"
+            store.save_manifest(manifest)
+            g = GlossaryStore(store.glossary_path)
+            pending_summary = build_report(store, g)["summary"]
+            self.assertEqual(pending_summary["glossary_pending"], 1)
+            self.assertTrue(pending_summary["titles_pending"])
+            g.close()
 
 
 class TestConsistency(unittest.TestCase):
@@ -223,6 +259,39 @@ class TestConsistency(unittest.TestCase):
             g.close()
             self.assertEqual(len(issues), 1)
             self.assertEqual(issues[0]["type"], "terminology")
+
+    def test_autofix_rejects_non_string_replacements(self):
+        from trans_novel.agents.consistency import ConsistencyChecker
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            store, cfg = _run(txt, os.path.join(d, "state"))
+            before = [
+                segment.target
+                for chapter in store.load_manifest()["chapters"]
+                for segment in store.load_chapter(chapter["index"]).text_segments
+            ]
+
+            def handler(messages, tier, json_mode):
+                return json.dumps({"replacements": [
+                    {"wrong": "润", "right": {"bad": True}},
+                    {"wrong": ["bad"], "right": "正确"},
+                    {"wrong": "润", "right": None},
+                ]}, ensure_ascii=False)
+
+            glossary = store.open_glossary()
+            result = ConsistencyChecker(
+                FakeClient(handler=handler), cfg
+            ).autofix(store, glossary)
+            glossary.close()
+            after = [
+                segment.target
+                for chapter in store.load_manifest()["chapters"]
+                for segment in store.load_chapter(chapter["index"]).text_segments
+            ]
+            self.assertEqual(result, {"replacements": [], "rewritten": 0})
+            self.assertEqual(after, before)
 
 
 if __name__ == "__main__":

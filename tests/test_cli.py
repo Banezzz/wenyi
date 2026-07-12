@@ -95,7 +95,7 @@ class TestCliConfig(unittest.TestCase):
         self.assertFalse(captured["polish"])
         self.assertTrue(captured["run_all"]["do_qa"])
 
-    def test_resume_delegates_to_translate_without_audit_argument(self):
+    def test_resume_forwards_quality_and_output_overrides(self):
         cfg = Config.from_dict(
             {
                 "llm": {"provider": "fake", "tiers": {"strong": {"model": "p"}}},
@@ -130,15 +130,18 @@ class TestCliConfig(unittest.TestCase):
         ):
             result = CliRunner().invoke(
                 app,
-                ["resume", "input.txt", "--format", "txt"],
+                [
+                    "resume", "input.txt", "--format", "txt",
+                    "--out", "custom.txt", "--no-polish", "--qa",
+                ],
             )
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(captured["input_path"], "input.txt")
         self.assertEqual(captured["run_all"]["out_format"], "txt")
-        self.assertIsNone(captured["run_all"]["out_path"])
-        self.assertIsNone(captured["run_all"]["do_qa"])
-        self.assertTrue(captured["polish"])
+        self.assertEqual(captured["run_all"]["out_path"], "custom.txt")
+        self.assertTrue(captured["run_all"]["do_qa"])
+        self.assertFalse(captured["polish"])
 
     def test_translate_missing_input_exits_before_loading_config(self):
         missing = os.path.join(tempfile.gettempdir(), "trans-novel-missing.epub")
@@ -170,6 +173,30 @@ class TestCliConfig(unittest.TestCase):
             self.assertEqual(result.exit_code, 1, result.output)
             self.assertIn("尚无进度", result.output)
             self.assertFalse(os.path.exists(state_dir))
+
+    def test_status_does_not_create_missing_database_for_existing_run(self):
+        from trans_novel.ingest.segmenter import load_document
+        from trans_novel.pipeline.runstore import RunStore, slugify
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "novel.txt")
+            state_dir = os.path.join(d, "state")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("# 第一章\n\n第一段。\n")
+            cfg = Config.from_dict({
+                "language": {"source": "ja", "target": "zh"},
+                "paths": {"state_dir": state_dir},
+            })
+            doc = load_document(src, "ja", "zh")
+            store = RunStore(os.path.join(state_dir, slugify(doc.title)))
+            store.init_from_document(doc, glossary_generation_id="expected")
+
+            with patch("trans_novel.cli._load_config", return_value=cfg):
+                result = CliRunner().invoke(app, ["status", src])
+
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("术语库状态无效", result.output)
+            self.assertFalse(os.path.exists(store.glossary_path))
 
 
 if __name__ == "__main__":
