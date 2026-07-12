@@ -49,7 +49,11 @@ class BackTranslator(Agent):
                               n=len(targets), numbered_target=prompts.numbered(targets))
         items = self._ask_json(system, user, tier="fast",  # 机械回译免思考；语义比对(check)仍走 cheap
                                key="backtranslations", default=[])
-        return [str(x) for x in items] if isinstance(items, list) else []
+        if not isinstance(items, list) or any(
+            not isinstance(item, str) for item in items
+        ):
+            return []
+        return items
 
     def check(self, sources: list[str], targets: list[str]) -> list[dict[str, Any]]:
         """对给定（已抽样的）段做回译并比对，返回偏离问题。index 为传入列表内的下标。"""

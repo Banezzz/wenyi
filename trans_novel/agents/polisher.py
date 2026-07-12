@@ -26,5 +26,10 @@ class Polisher(Agent):
         )
         items = self._ask_json(system, user, tier="strong", key="polished", default=None)
         if isinstance(items, list) and len(items) == n:
-            return [str(x) for x in items]
+            return [
+                candidate
+                if isinstance(candidate, str) and candidate.strip()
+                else original
+                for original, candidate in zip(targets, items)
+            ]
         return list(targets)  # 失败/段数不符 → 保守保留原译
