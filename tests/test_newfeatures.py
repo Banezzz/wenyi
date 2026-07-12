@@ -73,6 +73,47 @@ class TestPunct(unittest.TestCase):
 
 
 class TestGlossaryAudit(unittest.TestCase):
+    def test_decide_rejects_malformed_and_out_of_candidate_values(self):
+        from trans_novel.agents.glossary_auditor import GlossaryAuditor
+
+        cfg = Config.from_dict({
+            "language": {"source": "ja", "target": "zh"},
+            "llm": {"provider": "fake", "tiers": {
+                "strong": {"model": "p"}, "cheap": {"model": "f"}}},
+        })
+        candidates = {
+            "カホ": {
+                "source": "カホ",
+                "current": "佳穂",
+                "type": "人物",
+                "variants": ["佳穗"],
+            }
+        }
+        response = {"unifications": [
+            {"source": {"bad": True}, "canonical": "佳穂"},
+            {"source": "UNKNOWN", "canonical": "伪造"},
+            {"source": "カホ", "canonical": {"bad": True}},
+            {"source": "カホ", "canonical": "新造译法"},
+            {
+                "source": "カホ",
+                "canonical": "佳穂",
+                "variants": ["佳穗", None, {"bad": True}, "任意替换"],
+                "reason": {"bad": True},
+            },
+        ]}
+        auditor = GlossaryAuditor(
+            FakeClient(handler=lambda m, t, j: json.dumps(
+                response, ensure_ascii=False
+            )),
+            cfg,
+        )
+        self.assertEqual(auditor._decide(candidates), [{
+            "source": "カホ",
+            "canonical": "佳穂",
+            "variants": ["佳穗"],
+            "reason": "",
+        }])
+
     def test_unify_variants_and_rewrite_targets(self):
         from trans_novel.agents.glossary_auditor import GlossaryAuditor
 
@@ -97,7 +138,12 @@ class TestGlossaryAudit(unittest.TestCase):
             g.close()
             ch = store.load_chapter(0)
             ch.segments[1].target = "佳穂和佳穗在一起。"  # 同名两种写法
+            ch.meta.pop("glossary_plan", None)
             store.save_chapter(ch)
+            manifest = store.load_manifest()
+            manifest["chapters"][0].pop("glossary_status")
+            manifest["chapters"][0]["glossary_legacy"] = True
+            store.save_manifest(manifest)
 
             def handler(messages, tier, json_mode):
                 if "术语一致性审计员" in messages[0]["content"]:
@@ -113,11 +159,51 @@ class TestGlossaryAudit(unittest.TestCase):
             term = g.get_term("カホ")
             self.assertTrue(term.locked)
             self.assertIn("佳穗", term.aliases)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                "pending",
+            )
+            self.assertEqual(store.load_manifest()["titles_status"], "pending")
+            self.assertNotIn(
+                "glossary_legacy",
+                store.load_manifest()["chapters"][0],
+            )
+            self.assertNotIn(
+                "title_translated",
+                store.load_manifest()["chapters"][0],
+            )
+
+            from trans_novel.glossary.store import GlossaryCheckpoint
+            from trans_novel.pipeline.runstore import translation_fingerprint
+
+            rewritten = store.load_chapter(0)
+            final_checkpoint = GlossaryCheckpoint(
+                scope="chapter",
+                chapter=0,
+                start_index=0,
+                count=len(rewritten.text_segments),
+                fingerprint=translation_fingerprint(rewritten.text_segments),
+            )
+            self.assertFalse(g.checkpoint_matches(final_checkpoint))
             g.close()
 
             # 正文里的 佳穗 应已被改写为 佳穂
             ch2 = store.load_chapter(0)
             self.assertEqual(ch2.segments[1].target, "佳穂和佳穂在一起。")
+
+            resume_client = FakeClient(handler=routing_handler)
+            Orchestrator(cfg, client=resume_client).run(txt)
+            self.assertFalse(any(
+                "文学翻译" in call["messages"][0]["content"]
+                for call in resume_client.calls
+            ))
+            g = store.open_glossary()
+            self.assertTrue(g.checkpoint_matches(final_checkpoint))
+            g.close()
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                "done",
+            )
 
 
 class TestRunAll(unittest.TestCase):
