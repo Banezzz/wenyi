@@ -15,6 +15,10 @@ def build_report(store: RunStore, glossary: GlossaryStore) -> dict[str, Any]:
     m = store.load_manifest()
     chapters_total = len(m["chapters"])
     chapters_done = sum(1 for c in m["chapters"] if c["status"] == STATUS_DONE)
+    glossary_pending = sum(
+        1 for c in m["chapters"] if c.get("glossary_status") == "pending"
+    )
+    titles_pending = m.get("titles_status") == "pending"
 
     review_issues: list[dict] = []
     bt_issues: list[dict] = []
@@ -43,6 +47,8 @@ def build_report(store: RunStore, glossary: GlossaryStore) -> dict[str, Any]:
         "summary": {
             "chapters_total": chapters_total,
             "chapters_done": chapters_done,
+            "glossary_pending": glossary_pending,
+            "titles_pending": titles_pending,
             "terms": gstats["terms"],
             "open_conflicts": len(conflicts),
             "review_issues": len(review_issues),

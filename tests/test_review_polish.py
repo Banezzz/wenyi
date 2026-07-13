@@ -48,6 +48,19 @@ class TestPolisher(unittest.TestCase):
         out = p.polish(["甲", "乙"])
         self.assertEqual(out, ["甲", "乙"])  # 段数不符 → 保守保留原译
 
+    def test_polish_empty_item_keeps_original_segment(self):
+        client = FakeClient(handler=lambda m, t, j: json.dumps(
+            {"polished": ["润色甲", "   "]}, ensure_ascii=False))
+        p = Polisher(client, _cfg())
+        self.assertEqual(p.polish(["甲", "乙"]), ["润色甲", "乙"])
+
+    def test_polish_non_string_items_keep_original_segments(self):
+        client = FakeClient(handler=lambda m, t, j: json.dumps(
+            {"polished": [None, {}, 123, ["伪译"]]}, ensure_ascii=False))
+        p = Polisher(client, _cfg())
+        originals = ["甲", "乙", "丙", "丁"]
+        self.assertEqual(p.polish(originals), originals)
+
 
 class TestBackTranslator(unittest.TestCase):
     def test_check(self):
@@ -80,6 +93,20 @@ class TestBackTranslator(unittest.TestCase):
         self.assertEqual(issues[0]["type"], "backtranslation_alignment")
         self.assertEqual(issues[0]["expected"], 2)
         self.assertEqual(issues[0]["actual"], 1)
+
+    def test_backtranslation_non_string_items_report_alignment_failure(self):
+        def handler(messages, tier, json_mode):
+            if "回译译者" in messages[0]["content"]:
+                return json.dumps(
+                    {"backtranslations": [None, {"bad": True}]},
+                    ensure_ascii=False,
+                )
+            self.fail("非字符串回译不应进入语义比对")
+
+        issues = BackTranslator(
+            FakeClient(handler=handler), _cfg()
+        ).check(["あ", "い"], ["甲", "乙"])
+        self.assertEqual(issues[0]["type"], "backtranslation_alignment")
 
 
 if __name__ == "__main__":

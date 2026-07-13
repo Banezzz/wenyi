@@ -60,4 +60,6 @@ class Agent:
     @staticmethod
     def dict_items(items: Any) -> list[dict]:
         """过滤出 dict 元素（issues/terms 等模型返回列表的通用清洗）。"""
-        return [i for i in items or [] if isinstance(i, dict)]
+        if not isinstance(items, list):
+            return []
+        return [i for i in items if isinstance(i, dict)]

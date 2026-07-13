@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from trans_novel.config import Config
 from trans_novel.llm.base import FakeClient
@@ -126,7 +128,13 @@ class TestOrchestrator(unittest.TestCase):
             doc = load_document(txt, "ja", "zh")
             run_dir = os.path.join(cfg.state_dir, slugify(doc.title))
             store = RunStore(run_dir)
-            store.init_from_document(doc)
+            from trans_novel.glossary.store import GlossaryStore
+            glossary = GlossaryStore(store.glossary_path)
+            store.init_from_document(
+                doc,
+                glossary_generation_id=glossary.generation_id,
+            )
+            glossary.close()
             self.assertFalse(os.path.exists(store.analysis_path))
             self.assertFalse(os.path.exists(store.context_path))
 
@@ -141,6 +149,308 @@ class TestOrchestrator(unittest.TestCase):
             with open(repaired.event_log_path, "r", encoding="utf-8") as f:
                 events = [json.loads(line) for line in f if line.strip()]
             self.assertIn("analysis_repaired", [e["event"] for e in events])
+
+    def test_prepare_fails_closed_when_existing_glossary_database_is_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=routing_handler)
+            ).run(txt)
+            os.remove(store.glossary_path)
+
+            with self.assertRaisesRegex(FileNotFoundError, "database is missing"):
+                Orchestrator(
+                    cfg, client=FakeClient(handler=routing_handler)
+                ).prepare(txt)
+            self.assertFalse(os.path.exists(store.glossary_path))
+
+    def test_prepare_fails_closed_when_glossary_database_is_replaced(self):
+        from trans_novel.glossary.store import (
+            GlossaryStore,
+            GlossaryStoreIdentityError,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=routing_handler)
+            ).run(txt)
+            expected = store.load_manifest()["glossary_generation_id"]
+            os.replace(store.glossary_path, store.glossary_path + ".owned")
+            replacement = GlossaryStore(store.glossary_path)
+            actual = replacement.generation_id
+            replacement.close()
+            self.assertNotEqual(actual, expected)
+
+            with self.assertRaisesRegex(
+                GlossaryStoreIdentityError, "generation mismatch"
+            ):
+                Orchestrator(
+                    cfg, client=FakeClient(handler=routing_handler)
+                ).prepare(txt)
+
+    def test_new_manifest_missing_generation_rejects_replacement_database(self):
+        from trans_novel.glossary.store import (
+            GlossaryStore,
+            GlossaryStoreIdentityError,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=routing_handler)
+            ).run(txt)
+            manifest = store.load_manifest()
+            manifest.pop("glossary_generation_id")
+            store.save_manifest(manifest)
+            os.replace(store.glossary_path, store.glossary_path + ".owned")
+            replacement = GlossaryStore(store.glossary_path)
+            replacement.close()
+
+            with self.assertRaisesRegex(
+                GlossaryStoreIdentityError,
+                "new-format manifest is missing glossary_generation_id",
+            ):
+                Orchestrator(
+                    cfg, client=FakeClient(handler=routing_handler)
+                ).prepare(txt)
+
+    def test_positive_legacy_manifest_binds_existing_database_once(self):
+        from trans_novel.glossary.store import GlossaryStore
+        from trans_novel.ingest.segmenter import load_document
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            doc = load_document(txt, "ja", "zh")
+            store = RunStore(os.path.join(cfg.state_dir, slugify(doc.title)))
+            glossary = GlossaryStore(store.glossary_path)
+            generation = glossary.generation_id
+            glossary.close()
+            store.init_from_document(doc, glossary_generation_id=generation)
+            manifest = store.load_manifest()
+            for key in (
+                "state_format_version",
+                "analysis_glossary_status",
+                "titles_status",
+                "glossary_generation_id",
+            ):
+                manifest.pop(key)
+            for entry in manifest["chapters"]:
+                entry.pop("glossary_status")
+            store.save_manifest(manifest)
+
+            glossary = store.open_glossary()
+            glossary.close()
+            rebound = store.load_manifest()
+            self.assertEqual(rebound["glossary_generation_id"], generation)
+            self.assertEqual(rebound["state_format_version"], 1)
+            self.assertTrue(all(
+                entry.get("glossary_legacy") is True
+                for entry in rebound["chapters"]
+            ))
+
+    def test_migrated_legacy_markers_prevent_second_database_binding(self):
+        from trans_novel.glossary.store import (
+            GlossaryStore,
+            GlossaryStoreIdentityError,
+        )
+        from trans_novel.ingest.segmenter import load_document
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            doc = load_document(txt, "ja", "zh")
+            store = RunStore(os.path.join(cfg.state_dir, slugify(doc.title)))
+            glossary = GlossaryStore(store.glossary_path)
+            generation = glossary.generation_id
+            glossary.close()
+            store.init_from_document(doc, glossary_generation_id=generation)
+            manifest = store.load_manifest()
+            for key in (
+                "state_format_version",
+                "analysis_glossary_status",
+                "titles_status",
+                "glossary_generation_id",
+            ):
+                manifest.pop(key)
+            for entry in manifest["chapters"]:
+                entry.pop("glossary_status")
+            store.save_manifest(manifest)
+            store.open_glossary().close()
+
+            migrated = store.load_manifest()
+            migrated.pop("state_format_version")
+            migrated.pop("glossary_generation_id")
+            migrated["chapters"][0]["glossary_legacy"] = False
+            store.save_manifest(migrated)
+            os.replace(store.glossary_path, store.glossary_path + ".owned")
+            replacement = GlossaryStore(store.glossary_path)
+            replacement.close()
+
+            with self.assertRaisesRegex(
+                GlossaryStoreIdentityError,
+                "new-format manifest is missing glossary_generation_id",
+            ):
+                store.open_glossary()
+
+    def test_null_plan_prevents_pristine_legacy_database_adoption(self):
+        from trans_novel.glossary.store import (
+            GlossaryStore,
+            GlossaryStoreIdentityError,
+        )
+        from trans_novel.ingest.segmenter import load_document
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            doc = load_document(txt, "ja", "zh")
+            store = RunStore(os.path.join(cfg.state_dir, slugify(doc.title)))
+            glossary = GlossaryStore(store.glossary_path)
+            generation = glossary.generation_id
+            glossary.close()
+            store.init_from_document(doc, glossary_generation_id=generation)
+            manifest = store.load_manifest()
+            for key in (
+                "state_format_version",
+                "analysis_glossary_status",
+                "titles_status",
+                "glossary_generation_id",
+            ):
+                manifest.pop(key)
+            for entry in manifest["chapters"]:
+                entry.pop("glossary_status")
+            store.save_manifest(manifest)
+            chapter = store.load_chapter(0)
+            chapter.meta["glossary_plan"] = None
+            store.save_chapter(chapter)
+
+            with self.assertRaisesRegex(
+                GlossaryStoreIdentityError,
+                "new-format manifest is missing glossary_generation_id",
+            ):
+                store.open_glossary()
+
+    def test_prepare_fails_closed_on_orphan_database_without_manifest(self):
+        from trans_novel.glossary.store import GlossaryStore, GlossaryTerm
+        from trans_novel.ingest.segmenter import load_document
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            doc = load_document(txt, "ja", "zh")
+            store = RunStore(os.path.join(cfg.state_dir, slugify(doc.title)))
+            orphan = GlossaryStore(store.glossary_path)
+            orphan.upsert_term(
+                GlossaryTerm(
+                    source="POISON",
+                    target="污染",
+                    confidence="high",
+                    locked=True,
+                )
+            )
+            orphan.close()
+
+            with self.assertRaisesRegex(RuntimeError, "缺少 manifest.json"):
+                Orchestrator(
+                    cfg, client=FakeClient(handler=routing_handler)
+                ).prepare(txt)
+            self.assertFalse(store.exists())
+            orphan = GlossaryStore(store.glossary_path, create=False)
+            self.assertIsNotNone(orphan.get_term("POISON"))
+            orphan.close()
+
+    def test_analysis_is_saved_before_seed_and_status_done(self):
+        """A failed analysis save must leave SQLite unseeded and status pending."""
+        from trans_novel.glossary.store import GlossaryStore
+        from trans_novel.ingest.segmenter import load_document
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+
+            with patch.object(
+                RunStore,
+                "save_analysis",
+                side_effect=OSError("analysis disk failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "analysis disk failure"):
+                    Orchestrator(
+                        cfg, client=FakeClient(handler=routing_handler)
+                    ).prepare(txt)
+
+            doc = load_document(txt, "ja", "zh")
+            run_dir = os.path.join(cfg.state_dir, slugify(doc.title))
+            store = RunStore(run_dir)
+            self.assertEqual(
+                store.load_manifest()["analysis_glossary_status"],
+                STATUS_PENDING,
+            )
+            glossary = GlossaryStore(store.glossary_path)
+            self.assertEqual(glossary.stats()["terms"], 0)
+            glossary.close()
+            self.assertFalse(os.path.exists(store.analysis_path))
+
+    def test_prepare_retries_saved_analysis_seed_after_storage_failure(self):
+        """analysis 已保存但原子 seed 失败时，续跑从文件重试且不再请求 analyzer。"""
+        from trans_novel.glossary.store import GlossaryStore
+        from trans_novel.ingest.segmenter import load_document
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+
+            with patch.object(
+                GlossaryStore,
+                "upsert_terms",
+                side_effect=sqlite3.OperationalError("disk I/O error"),
+            ):
+                with self.assertRaises(sqlite3.OperationalError):
+                    Orchestrator(
+                        cfg, client=FakeClient(handler=routing_handler)
+                    ).prepare(txt)
+
+            doc = load_document(txt, "ja", "zh")
+            store = RunStore(os.path.join(cfg.state_dir, slugify(doc.title)))
+            self.assertTrue((store.load_analysis() or {}).get("characters"))
+            self.assertEqual(
+                store.load_manifest()["analysis_glossary_status"],
+                STATUS_PENDING,
+            )
+
+            def no_reanalysis(messages, tier, json_mode):
+                if "前期分析师" in messages[0]["content"]:
+                    raise AssertionError("saved analysis should be reused")
+                return routing_handler(messages, tier, json_mode)
+
+            repaired = Orchestrator(
+                cfg, client=FakeClient(handler=no_reanalysis)
+            ).prepare(txt)
+            self.assertEqual(
+                repaired.load_manifest()["analysis_glossary_status"],
+                STATUS_DONE,
+            )
+            glossary = GlossaryStore(repaired.glossary_path)
+            self.assertIsNotNone(glossary.get_term("綾小路"))
+            glossary.close()
+            with open(repaired.event_log_path, encoding="utf-8") as f:
+                events = [json.loads(line) for line in f if line.strip()]
+            self.assertIn(
+                "analysis_glossary_seed_repaired",
+                [event["event"] for event in events],
+            )
 
 
 class TestSegmentLevelResume(unittest.TestCase):
@@ -183,6 +493,117 @@ class TestSegmentLevelResume(unittest.TestCase):
             # 之前已译的段仍是 R1（未被跨位置复用、也未重翻），补译段是 R2
             self.assertTrue(ch2.text_segments[0].target.startswith("R1"))
             self.assertTrue(ch2.text_segments[-1].target.startswith("R2"))
+
+    def test_legacy_done_chapter_with_hole_reopens_only_missing_segment(self):
+        """Legacy done+empty is migrated without changing saved translations."""
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.review = False
+            cfg.pipeline.polish = False
+            cfg.pipeline.book_understanding = False
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=self._tr_handler("R1"))
+            ).run(txt)
+            chapter = store.load_chapter(0)
+            preserved = chapter.text_segments[0].target
+            chapter.text_segments[1].target = ""
+            chapter.meta.pop("glossary_plan", None)
+            store.save_chapter(chapter)
+            manifest = store.load_manifest()
+            manifest["chapters"][0].pop("glossary_status", None)
+            manifest["chapters"][0]["glossary_legacy"] = True
+            manifest["chapters"][0]["status"] = STATUS_DONE
+            store.save_manifest(manifest)
+
+            client = FakeClient(handler=self._tr_handler("R2"))
+            Orchestrator(cfg, client=client).run(txt)
+            repaired = store.load_chapter(0)
+            self.assertEqual(_translated_para_count(client.calls), 1)
+            self.assertEqual(repaired.text_segments[0].target, preserved)
+            self.assertEqual(repaired.text_segments[1].target, "R2译0")
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["status"], STATUS_DONE
+            )
+            with open(store.event_log_path, encoding="utf-8") as f:
+                names = [json.loads(line)["event"] for line in f if line.strip()]
+            self.assertIn("legacy_chapter_translation_reopened", names)
+
+    def test_partial_resume_autofix_cannot_overwrite_saved_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.polish = False
+            cfg.pipeline.book_understanding = False
+            cfg.pipeline.autofix_severe = True
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=routing_handler)
+            ).prepare(txt)
+            chapter = store.load_chapter(0)
+            preserved = "  已保存译文，不得覆盖。  "
+            chapter.text_segments[0].target = preserved
+            store.save_chapter(chapter)
+
+            def handler(messages, tier, json_mode):
+                system = messages[0]["content"]
+                user = messages[-1]["content"]
+                if "译文审校" in system:
+                    return json.dumps({"issues": [{
+                        "index": 0,
+                        "type": "missing",
+                        "detail": "要求覆盖旧段",
+                        "suggestion": "重译",
+                    }]}, ensure_ascii=False)
+                if "文学翻译" in system and "【审校意见】" in user:
+                    return json.dumps(
+                        {"translations": ["不应采用的覆盖译文"]},
+                        ensure_ascii=False,
+                    )
+                return self._tr_handler("R2")(messages, tier, json_mode)
+
+            client = FakeClient(handler=handler)
+            Orchestrator(cfg, client=client).run(txt, only_chapter=0)
+            repaired = store.load_chapter(0)
+            self.assertEqual(repaired.text_segments[0].target, preserved)
+            self.assertFalse(any(
+                "文学翻译" in call["messages"][0]["content"]
+                and "【审校意见】" in call["messages"][-1]["content"]
+                for call in client.calls
+            ))
+            saved_issue = next(
+                issue for issue in repaired.meta["review_issues"]
+                if issue.get("detail") == "要求覆盖旧段"
+            )
+            self.assertFalse(saved_issue["fixed"])
+            with open(store.event_log_path, encoding="utf-8") as f:
+                events = [json.loads(line) for line in f if line.strip()]
+            self.assertTrue(any(
+                event["event"] == "autofix_skipped"
+                and event.get("reason") == "saved_target_immutable"
+                for event in events
+            ))
+
+    def test_context_is_rebuilt_from_done_chapters_not_stale_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.review = False
+            cfg.pipeline.polish = False
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=routing_handler)
+            ).run(txt)
+            store.save_context({"recent_targets": ["STALE-CONTEXT"]})
+
+            rebuilt = Orchestrator._context_before_chapter(store, 1)
+            chapter_zero_targets = [
+                segment.target for segment in store.load_chapter(0).text_segments
+            ]
+            self.assertNotIn("STALE-CONTEXT", rebuilt.recent_targets)
+            for target in chapter_zero_targets:
+                self.assertIn(target, rebuilt.recent_targets)
 
 
 class TestBookUnderstanding(unittest.TestCase):
@@ -324,6 +745,101 @@ class TestReviewReporting(unittest.TestCase):
             self.assertTrue(all("chapter" in i for i in flagged))
             self.assertEqual(ch.text_segments[0].target, self.FIX_TEXT)
 
+            from trans_novel.glossary.store import GlossaryCheckpoint, GlossaryStore
+            from trans_novel.pipeline.runstore import translation_fingerprint
+
+            glossary = GlossaryStore(store.glossary_path)
+            plan = ch.meta["glossary_plan"]
+            for unit in plan["units"]:
+                start = unit["start_index"]
+                segments = ch.text_segments[start:start + unit["count"]]
+                self.assertTrue(glossary.checkpoint_matches(GlossaryCheckpoint(
+                    scope="batch",
+                    chapter=0,
+                    start_index=start,
+                    count=len(segments),
+                    fingerprint=translation_fingerprint(segments),
+                )))
+            self.assertTrue(glossary.checkpoint_matches(GlossaryCheckpoint(
+                scope="chapter",
+                chapter=0,
+                start_index=0,
+                count=len(ch.text_segments),
+                fingerprint=translation_fingerprint(ch.text_segments),
+            )))
+            glossary.close()
+            with open(store.event_log_path, encoding="utf-8") as f:
+                events = [json.loads(line) for line in f if line.strip()]
+            self.assertIn(
+                "glossary_post_review_refreshed",
+                [event["event"] for event in events],
+            )
+            context = store.load_context()
+            self.assertIn(self.FIX_TEXT, context["recent_targets"])
+            self.assertEqual(
+                context,
+                Orchestrator._context_before_chapter(store, 2).to_dict(),
+            )
+
+    def test_backtranslation_uses_final_autofix_targets_and_chapter_indices(self):
+        """Sampling happens after autofix and maps sample-local issue indices."""
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.autofix_severe = True
+            cfg.pipeline.backtranslate_sample = 1.0
+            base_handler = self._handler(self.FIX_TEXT)
+
+            def handler(messages, tier, json_mode):
+                if "翻译保真度核查员" in messages[0]["content"]:
+                    return json.dumps(
+                        {"issues": [{"index": 1, "detail": "sample issue"}]},
+                        ensure_ascii=False,
+                    )
+                return base_handler(messages, tier, json_mode)
+
+            client = FakeClient(handler=handler)
+            store = Orchestrator(cfg, client=client).run(txt)
+            backtranslation_calls = [
+                call for call in client.calls
+                if "回译译者" in call["messages"][0]["content"]
+            ]
+            self.assertTrue(backtranslation_calls)
+            self.assertTrue(any(
+                self.FIX_TEXT in call["messages"][-1]["content"]
+                for call in backtranslation_calls
+            ))
+            issues = store.load_chapter(0).meta["backtranslation_issues"]
+            self.assertTrue(issues)
+            self.assertEqual(issues[0]["index"], 1)
+
+    def test_resume_rebuilds_backtranslation_sample_from_saved_targets(self):
+        """A crash after target save cannot suppress deterministic sampling."""
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.review = False
+            cfg.pipeline.polish = False
+            cfg.pipeline.book_understanding = False
+            cfg.pipeline.backtranslate_sample = 1.0
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=routing_handler)
+            ).prepare(txt)
+            chapter = store.load_chapter(0)
+            for index, segment in enumerate(chapter.text_segments):
+                segment.target = f"中断前已存译文{index}"
+            store.save_chapter(chapter)
+
+            client = FakeClient(handler=routing_handler)
+            Orchestrator(cfg, client=client).run(txt, only_chapter=0)
+            self.assertEqual(_translated_para_count(client.calls), 0)
+            self.assertTrue(any(
+                "回译译者" in call["messages"][0]["content"]
+                for call in client.calls
+            ))
+
     def test_autofix_off_reports_only(self):
         """autofix 关：仅上报 fixed=False，正文不动。"""
         with tempfile.TemporaryDirectory() as d:
@@ -364,6 +880,28 @@ class TestReviewReporting(unittest.TestCase):
                           if i.get("type") == "missing")
             # 每块报 index 0 → 映射后应为各块首段的章内段号（0,1,2,...互不相同）
             self.assertEqual(idxs, list(range(len(ch.text_segments))))
+
+    def test_review_rejects_boolean_index(self):
+        def handler(messages, tier, json_mode):
+            if "译文审校" in messages[0]["content"]:
+                return json.dumps({"issues": [{
+                    "index": False,
+                    "type": "missing",
+                    "detail": "布尔值不是段号",
+                }]}, ensure_ascii=False)
+            return routing_handler(messages, tier, json_mode)
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.autofix_severe = True
+            client = FakeClient(handler=handler)
+            store = Orchestrator(cfg, client=client).run(txt)
+            self.assertFalse(any(
+                issue.get("detail") == "布尔值不是段号"
+                for issue in store.load_chapter(0).meta["review_issues"]
+            ))
 
     def test_length_issues_survive_chapter_review(self):
         """批次廉价长度问题不能被章末 review 覆盖掉。"""
@@ -595,6 +1133,551 @@ class TestGlossaryScope(unittest.TestCase):
             cfg.segment.max_chars_per_batch = 200
 
             Orchestrator(cfg, client=FakeClient(handler=handler)).run(txt)
+
+
+class TestGlossaryCheckpointResume(unittest.TestCase):
+    """翻译产物与术语抽取解耦后的断点恢复契约。"""
+
+    @staticmethod
+    def _write_book(root: str) -> str:
+        path = os.path.join(root, "checkpoint.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "# 第一章\n\n"
+                "夏帆ちゃんは窓の外を見た。\n\n"
+                "母親は夏帆ちゃんに静かに声をかけた。\n\n"
+                "二人はしばらく黙っていた。\n"
+            )
+        return path
+
+    @staticmethod
+    def _checkpoint_config(root: str, *, batch_chars: int = 10_000):
+        cfg = _config(os.path.join(root, "state"))
+        cfg.segment.max_chars_per_batch = batch_chars
+        cfg.pipeline.polish = False
+        cfg.pipeline.review = False
+        cfg.pipeline.consistency_qa = False
+        cfg.pipeline.book_understanding = False
+        return cfg
+
+    @staticmethod
+    def _handler(*, glossary_reply: str | None = None):
+        def handler(messages, tier, json_mode):
+            system = messages[0]["content"]
+            user = messages[-1]["content"]
+            if "文学翻译" in system:
+                n = len(re.findall(r"^\[(\d+)\]", user, re.M))
+                return json.dumps(
+                    {"translations": [f"续跑译文{i}" for i in range(n)]},
+                    ensure_ascii=False,
+                )
+            if "术语" in system and "抽取器" in system:
+                if glossary_reply is not None:
+                    return glossary_reply
+                return json.dumps({"terms": [{
+                    "source": "夏帆ちゃん",
+                    "target": "小夏帆",
+                    "type": "称谓",
+                }]}, ensure_ascii=False)
+            return routing_handler(messages, tier, json_mode)
+        return handler
+
+    @staticmethod
+    def _events(store: RunStore) -> list[dict]:
+        if not os.path.isfile(store.event_log_path):
+            return []
+        with open(store.event_log_path, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    @staticmethod
+    def _glossary_call_count(client: FakeClient) -> int:
+        return sum(
+            "术语" in c["messages"][0]["content"]
+            and "抽取器" in c["messages"][0]["content"]
+            for c in client.calls
+        )
+
+    def test_model_failure_keeps_translation_done_and_retries_only_glossary(self):
+        """模型协议失败不丢译文；续跑只补术语，不再次调用译者。"""
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+
+            failed = FakeClient(handler=self._handler(glossary_reply="not valid json"))
+            store = Orchestrator(cfg, client=failed).run(txt)
+            manifest = store.load_manifest()
+            self.assertEqual(manifest["chapters"][0]["status"], STATUS_DONE)
+            self.assertEqual(manifest["chapters"][0]["glossary_status"], STATUS_PENDING)
+            self.assertEqual(manifest["titles_status"], STATUS_PENDING)
+            self.assertNotIn("title_translated", manifest["chapters"][0])
+            before = [s.target for s in store.load_chapter(0).text_segments]
+            context_before = store.load_context()
+            self.assertTrue(all(before))
+            failures = [
+                e for e in self._events(store)
+                if e["event"] == "glossary_extraction_failed"
+            ]
+            self.assertTrue(failures)
+            self.assertTrue(all(e.get("error_kind") for e in failures))
+
+            resumed = FakeClient(handler=self._handler())
+            store = Orchestrator(cfg, client=resumed).run(txt)
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertGreater(self._glossary_call_count(resumed), 0)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_DONE,
+            )
+            self.assertEqual(store.load_manifest()["titles_status"], STATUS_DONE)
+            self.assertTrue(
+                store.load_manifest()["chapters"][0].get("title_translated")
+            )
+            self.assertEqual(
+                [s.target for s in store.load_chapter(0).text_segments],
+                before,
+            )
+            self.assertEqual(store.load_context(), context_before)
+            completed = [
+                e for e in self._events(store)
+                if e["event"] in {
+                    "batch_glossary_extracted",
+                    "chapter_glossary_extracted",
+                }
+                and e.get("checkpoint_version") == 1
+            ]
+            self.assertTrue(completed)
+            self.assertTrue(all(e.get("completed") is True for e in completed))
+            self.assertTrue(all(e.get("fingerprint") for e in completed))
+            self.assertTrue(all(e.get("generation_id") for e in completed))
+
+    def test_persistence_failure_is_fatal_after_targets_are_saved(self):
+        """SQLite 写失败必须中止，但刚完成的 canonical unit 译文已经原子落盘。"""
+        from trans_novel.glossary.extractor import GlossaryPersistenceError
+        from trans_novel.glossary.store import GlossaryStore
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+            store = Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler()),
+            ).prepare(txt)
+
+            with patch.object(
+                GlossaryStore,
+                "upsert_terms",
+                side_effect=sqlite3.OperationalError("disk I/O error"),
+            ):
+                with self.assertRaises(GlossaryPersistenceError):
+                    Orchestrator(
+                        cfg,
+                        client=FakeClient(handler=self._handler()),
+                    ).run(txt)
+
+            self.assertTrue(all(s.target for s in store.load_chapter(0).text_segments))
+            manifest = store.load_manifest()
+            self.assertEqual(manifest["chapters"][0]["status"], STATUS_PENDING)
+            self.assertEqual(manifest["chapters"][0]["glossary_status"], STATUS_PENDING)
+            self.assertIn(
+                "glossary_persistence_failed",
+                [e["event"] for e in self._events(store)],
+            )
+
+    def test_partial_canonical_unit_translates_only_missing_segments(self):
+        """unit 内部分段已保存时，只翻连续缺口，原 target 必须逐字保持。"""
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+            store = Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler()),
+            ).prepare(txt)
+            chapter = store.load_chapter(0)
+            kept = "  已保存译文\n标点，空白都不能变化。  "
+            chapter.text_segments[1].target = kept
+            store.save_chapter(chapter)
+
+            client = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=client).run(txt)
+
+            self.assertEqual(
+                _translated_para_count(client.calls),
+                len(chapter.text_segments) - 1,
+            )
+            self.assertEqual(store.load_chapter(0).text_segments[1].target, kept)
+
+    def test_persisted_glossary_plan_ignores_later_batch_budget_change(self):
+        """canonical plan 一经持久化，续跑配置变化不得重新切 unit。"""
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d, batch_chars=25)
+            bad_reply = "not valid json"
+            store = Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler(glossary_reply=bad_reply)),
+            ).run(txt)
+            before = store.load_chapter(0).meta["glossary_plan"]
+            self.assertEqual(before["version"], 1)
+            self.assertGreater(len(before["units"]), 1)
+            self.assertTrue(all(
+                {"start_index", "count", "source_fingerprint"} <= set(unit)
+                for unit in before["units"]
+            ))
+
+            changed = self._checkpoint_config(d, batch_chars=10_000)
+            Orchestrator(
+                changed,
+                client=FakeClient(handler=self._handler(glossary_reply=bad_reply)),
+            ).run(txt)
+            self.assertEqual(
+                store.load_chapter(0).meta["glossary_plan"],
+                before,
+            )
+
+    def test_db_checkpoint_is_authoritative_when_audit_event_is_missing(self):
+        """事务已提交但 event 未追加的崩溃窗，续跑从 DB 跳过模型抽取。"""
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+            store = Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler()),
+            ).run(txt)
+
+            success_events = {
+                "batch_glossary_extracted",
+                "chapter_glossary_extracted",
+            }
+            remaining = [
+                event for event in self._events(store)
+                if event["event"] not in success_events
+            ]
+            with open(store.event_log_path, "w", encoding="utf-8") as f:
+                for event in remaining:
+                    f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            manifest = store.load_manifest()
+            manifest["chapters"][0]["glossary_status"] = STATUS_PENDING
+            store.save_manifest(manifest)
+
+            resumed = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=resumed).run(txt)
+
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertEqual(self._glossary_call_count(resumed), 0)
+            names = [e["event"] for e in self._events(store)]
+            self.assertIn("batch_glossary_skipped", names)
+            self.assertIn("chapter_glossary_skipped", names)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_DONE,
+            )
+
+    def test_done_manifest_is_reopened_when_chapter_checkpoint_is_missing(self):
+        """Explicit done is only a projection; SQLite completion is audited."""
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+            store = Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler()),
+            ).run(txt)
+            glossary = store.open_glossary()
+            glossary.conn.execute(
+                "DELETE FROM glossary_extraction_checkpoints "
+                "WHERE scope='chapter' AND chapter=0"
+            )
+            glossary.conn.commit()
+            glossary.close()
+
+            Orchestrator(
+                cfg, client=FakeClient(handler=self._handler())
+            ).prepare(txt)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_PENDING,
+            )
+
+            resumed = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=resumed).run(txt)
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertEqual(self._glossary_call_count(resumed), 1)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_DONE,
+            )
+
+    def test_new_format_done_chapter_with_empty_target_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=self._handler())
+            ).run(txt)
+            chapter = store.load_chapter(0)
+            chapter.text_segments[0].target = ""
+            store.save_chapter(chapter)
+
+            with self.assertRaisesRegex(RuntimeError, "新格式状态"):
+                Orchestrator(
+                    cfg, client=FakeClient(handler=self._handler())
+                ).prepare(txt)
+
+    def test_one_marker_glossary_state_contradictions_fail_closed(self):
+        for defect in ("missing_status", "done_without_plan"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as d:
+                txt = self._write_book(d)
+                cfg = self._checkpoint_config(d)
+                store = Orchestrator(
+                    cfg, client=FakeClient(handler=self._handler())
+                ).run(txt)
+                chapter = store.load_chapter(0)
+                manifest = store.load_manifest()
+                if defect == "missing_status":
+                    manifest["chapters"][0].pop("glossary_status")
+                else:
+                    chapter.meta.pop("glossary_plan")
+                    store.save_chapter(chapter)
+                store.save_manifest(manifest)
+
+                with self.assertRaisesRegex(RuntimeError, "术语.*(缺失|缺少)"):
+                    Orchestrator(
+                        cfg, client=FakeClient(handler=self._handler())
+                    ).prepare(txt)
+
+    def test_new_format_both_chapter_markers_missing_fails_closed(self):
+        for with_empty_target in (False, True):
+            with self.subTest(with_empty_target=with_empty_target), tempfile.TemporaryDirectory() as d:
+                txt = self._write_book(d)
+                cfg = self._checkpoint_config(d)
+                store = Orchestrator(
+                    cfg, client=FakeClient(handler=self._handler())
+                ).run(txt)
+                chapter = store.load_chapter(0)
+                chapter.meta.pop("glossary_plan")
+                if with_empty_target:
+                    chapter.text_segments[0].target = ""
+                store.save_chapter(chapter)
+                manifest = store.load_manifest()
+                manifest["chapters"][0].pop("glossary_status")
+                manifest["chapters"][0].pop("glossary_legacy", None)
+                store.save_manifest(manifest)
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "(没有 legacy 迁移证据|新格式状态)",
+                ):
+                    Orchestrator(
+                        cfg, client=FakeClient(handler=self._handler())
+                    ).prepare(txt)
+
+    def test_legacy_marker_cannot_coexist_with_new_chapter_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=self._handler())
+            ).run(txt)
+            manifest = store.load_manifest()
+            manifest["chapters"][0]["glossary_legacy"] = True
+            store.save_manifest(manifest)
+
+            with self.assertRaisesRegex(RuntimeError, "legacy 迁移标记"):
+                Orchestrator(
+                    cfg, client=FakeClient(handler=self._handler())
+                ).prepare(txt)
+
+    def test_null_glossary_plan_fails_closed_in_all_resume_states(self):
+        for state in ("pending", "done", "legacy_hole"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as d:
+                txt = self._write_book(d)
+                cfg = self._checkpoint_config(d)
+                if state == "pending":
+                    store = Orchestrator(
+                        cfg, client=FakeClient(handler=self._handler())
+                    ).prepare(txt)
+                else:
+                    store = Orchestrator(
+                        cfg, client=FakeClient(handler=self._handler())
+                    ).run(txt)
+                chapter = store.load_chapter(0)
+                chapter.meta["glossary_plan"] = None
+                if state == "legacy_hole":
+                    chapter.text_segments[0].target = ""
+                store.save_chapter(chapter)
+                if state == "legacy_hole":
+                    manifest = store.load_manifest()
+                    entry = manifest["chapters"][0]
+                    entry.pop("glossary_status")
+                    entry["glossary_legacy"] = True
+                    store.save_manifest(manifest)
+
+                with self.assertRaisesRegex(RuntimeError, "(术语计划|新格式状态)"):
+                    Orchestrator(
+                        cfg, client=FakeClient(handler=self._handler())
+                    ).prepare(txt)
+
+    def test_empty_done_chapter_without_plan_is_valid(self):
+        from trans_novel.glossary.store import GlossaryStore
+        from trans_novel.ingest.models import Chapter, Document
+
+        with tempfile.TemporaryDirectory() as d:
+            store = RunStore(os.path.join(d, "empty-run"))
+            glossary = GlossaryStore(store.glossary_path)
+            document = Document(
+                title="Empty",
+                source_lang="ja",
+                target_lang="zh",
+                fmt="txt",
+                chapters=[Chapter(index=0, title="Empty", segments=[])],
+            )
+            store.init_from_document(
+                document,
+                glossary_generation_id=glossary.generation_id,
+            )
+            store.set_chapter_status(0, STATUS_DONE)
+            store.set_chapter_glossary_status(0, STATUS_DONE)
+            Orchestrator(
+                self._checkpoint_config(d),
+                client=FakeClient(handler=self._handler()),
+            )._reconcile_glossary_statuses(store, glossary)
+            glossary.close()
+
+    def test_title_retry_marker_survives_glossary_recovery_failure(self):
+        """A title protocol failure remains pending after glossary recovery."""
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_book(d)
+            cfg = self._checkpoint_config(d)
+            Orchestrator(
+                cfg,
+                client=FakeClient(
+                    handler=self._handler(glossary_reply="not valid json")
+                ),
+            ).run(txt)
+
+            base = self._handler()
+
+            def bad_title(messages, tier, json_mode):
+                if "标题翻译专家" in messages[0]["content"]:
+                    return json.dumps({"titles": []}, ensure_ascii=False)
+                return base(messages, tier, json_mode)
+
+            store = Orchestrator(
+                cfg, client=FakeClient(handler=bad_title)
+            ).run(txt)
+            self.assertEqual(store.load_manifest()["titles_status"], STATUS_PENDING)
+
+            client = FakeClient(handler=self._handler())
+            store = Orchestrator(cfg, client=client).run(txt)
+            self.assertEqual(store.load_manifest()["titles_status"], STATUS_DONE)
+            self.assertTrue(any(
+                "标题翻译专家" in call["messages"][0]["content"]
+                for call in client.calls
+            ))
+
+    def test_invalid_persisted_plan_fails_closed_without_touching_targets(self):
+        """plan 缺口、重叠或源指纹漂移时停止续跑，绝不猜测边界或改译文。"""
+        from trans_novel.pipeline.runstore import source_fingerprint
+
+        for defect in ("gap", "overlap", "source_fingerprint"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as d:
+                txt = self._write_book(d)
+                cfg = self._checkpoint_config(d)
+                store = Orchestrator(
+                    cfg,
+                    client=FakeClient(handler=self._handler()),
+                ).prepare(txt)
+                chapter = store.load_chapter(0)
+                chapter.text_segments[1].target = "  原样保留\n不可改写。  "
+                sources = [segment.source for segment in chapter.text_segments]
+                count = len(sources)
+
+                def unit(start: int, size: int) -> dict:
+                    return {
+                        "start_index": start,
+                        "count": size,
+                        "source_fingerprint": source_fingerprint(
+                            sources[start:start + size]
+                        ),
+                    }
+
+                if defect == "gap":
+                    units = [unit(1, count - 1)]
+                elif defect == "overlap":
+                    units = [unit(0, 2), unit(1, count - 1)]
+                else:
+                    units = [unit(0, count)]
+                    units[0]["source_fingerprint"] = "0" * 64
+                chapter.meta["glossary_plan"] = {"version": 1, "units": units}
+                store.save_chapter(chapter)
+                before = [s.target for s in chapter.text_segments]
+
+                with self.assertRaisesRegex(RuntimeError, "术语计划"):
+                    Orchestrator(
+                        cfg,
+                        client=FakeClient(handler=self._handler()),
+                    ).run(txt)
+
+                after = [s.target for s in store.load_chapter(0).text_segments]
+                self.assertEqual(after, before)
+                self.assertIn(
+                    "glossary_plan_invalid",
+                    [event["event"] for event in self._events(store)],
+                )
+
+    def _resume_with_legacy_batch_summary(self, root: str, summary: dict[str, int]):
+        txt = self._write_book(root)
+        cfg = self._checkpoint_config(root)
+        store = Orchestrator(
+            cfg,
+            client=FakeClient(handler=self._handler(glossary_reply="not valid json")),
+        ).run(txt)
+        unit = store.load_chapter(0).meta["glossary_plan"]["units"][0]
+        store.log_event(
+            "batch_glossary_extracted",
+            chapter=0,
+            start_index=unit["start_index"],
+            count=unit["count"],
+            summary=summary,
+        )
+
+        resumed = FakeClient(handler=self._handler())
+        Orchestrator(cfg, client=resumed).run(txt)
+        return store, resumed
+
+    def test_legacy_zero_summary_is_retried(self):
+        """旧版全零 summary 不证明模型成功，batch 与 chapter 都必须重抽。"""
+        with tempfile.TemporaryDirectory() as d:
+            store, resumed = self._resume_with_legacy_batch_summary(d, {
+                "inserted": 0,
+                "updated": 0,
+                "conflict": 0,
+                "unchanged": 0,
+            })
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertEqual(self._glossary_call_count(resumed), 2)
+            extracted = [
+                e for e in self._events(store)
+                if e["event"] == "batch_glossary_extracted"
+                and e.get("checkpoint_version") == 1
+            ]
+            self.assertTrue(extracted)
+
+    def test_legacy_nonzero_exact_event_promotes_batch_checkpoint(self):
+        """旧版非零 summary + 同 key 精确 batch_translated 可晋升，batch 不重抽。"""
+        with tempfile.TemporaryDirectory() as d:
+            store, resumed = self._resume_with_legacy_batch_summary(d, {
+                "inserted": 1,
+                "updated": 0,
+                "conflict": 0,
+                "unchanged": 0,
+            })
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertEqual(self._glossary_call_count(resumed), 1)
+            skipped = [
+                e for e in self._events(store)
+                if e["event"] == "batch_glossary_skipped"
+            ]
+            self.assertTrue(skipped)
 
 
 class TestTierRouting(unittest.TestCase):

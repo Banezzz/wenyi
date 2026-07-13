@@ -8,7 +8,7 @@
 
 ```bash
 uv sync
-export DEEPSEEK_API_KEY=sk-...
+export LONGCAT_API_KEY='<your-key>'
 uv run trans-novel translate book.epub
 ```
 
@@ -17,8 +17,23 @@ uv run trans-novel translate book.epub
 中断后继续：
 
 ```bash
-uv run trans-novel resume book.epub
+uv run trans-novel resume book.epub --polish --qa
 ```
+
+`translate` 本身也有同样的续跑语义；`resume` 只是更明确的入口。程序会复用
+`state/<book-slug>/`，只请求仍缺译文的连续段区间。已经落盘的译文不会因为术语抽取失败
+而重翻；若译文已经完整但术语 checkpoint 尚未完成，续跑只补术语阶段。
+`resume` 支持与 `translate` 相同的 `--format`、`--out`、`--polish/--no-polish` 和
+`--qa/--no-qa` 覆盖项。命令行覆盖不会改写 `config.yaml`，因此依赖覆盖项的长任务在续跑时
+应再次给出相同开关。
+
+已有 run 的 manifest 会绑定 `glossary.db` 的 generation ID。数据库缺失、被另一份数据库
+替换，或 manifest 丢失但目录仍有残留产物时，命令会失败关闭，不会静默创建/复用空库并
+误报完成。
+
+同一本书的同一 `state/<book-slug>/` 同一时间只允许一个 `translate` 或 `resume`
+进程写入。备份、恢复和迁移状态前也应先停止该 writer；操作步骤见
+[开发文档的状态备份与恢复](docs/dev.md#状态备份与恢复)。
 
 查看进度：
 
@@ -107,6 +122,7 @@ uv run trans-novel translate book.epub --no-qa
 - **滚动上下文**：章内批次串行处理，后一个批次能看到前面最近几段译文。
 - **段数对齐**：每批输入 N 段，要求模型输出 N 段 JSON；段数不符会重试，仍失败则逐段兜底。
 - **章末 review**：按章检查漏译、误译、术语、人称等问题；默认只记录问题，是否自动修复由 `autofix_severe` 控制。
+- **回译抽检**：从章末最终译文按稳定指纹确定性抽样；续跑会从已保存 target 重建同一抽样，自动修订后的译文也是回译输入。
 - **标点规范化**：译文统一为简体中文大陆常用全角标点。
 
 ## 常用工具
@@ -123,26 +139,37 @@ uv run trans-novel tools assemble book.epub
 
 ## 模型档位
 
-默认配置使用 DeepSeek，并通过 OpenAI SDK 调用 `https://api.deepseek.com`。
+仓库内的 `config.yaml` 默认使用 LongCat，通过 OpenAI SDK 调用
+`https://api.longcat.chat/openai/v1`，并从 `LONGCAT_API_KEY` 读取密钥。
+也可以把 `llm.provider`、`base_url` 和 `api_key_env` 改为 DeepSeek 对应配置。
 
 - `strong`: 翻译、润色、全局分析、标题翻译。
 - `cheap`: 章末 review、一致性 QA、回译比对。
 - `fast`: 全书预扫、章节梗概、术语抽取、回译等机械任务。
 
-如果模型 ID 变化，直接改 `config.yaml` 里的 `llm.tiers`。
+默认 `strong` 和 `cheap` 都开启 thinking 且保持 `reasoning_effort: high`；`fast` 为机械任务
+关闭 thinking。若模型 ID 变化，直接改 `config.yaml` 里的 `llm.tiers`。
+
+## 开发文档
+
+- [设计与恢复手册](docs/dev.md)：模块边界、术语 checkpoint、续跑与状态备份/恢复。
+- [状态与调用契约](docs/api.md)：CLI、运行目录、manifest、事件和 SQLite 边界。
+- [变更记录](docs/progress.md)：可感知的功能、修复及验证方式。
+- [未解决审计项](docs/audits.md)：当前仍需处理的正确性或运维限制。
 
 ## 项目结构
 
 ```text
 trans_novel/
   ingest/       输入解析、EPUB/FB2/TXT 切分
-  llm/          LLM 抽象接口、DeepSeek provider、FakeClient
+  llm/          LLM 抽象接口、LongCat/DeepSeek provider、FakeClient
   glossary/     SQLite 术语库、抽取、冲突处理
   agents/       分析、翻译、审校、润色、一致性、提示词
   pipeline/     编排器、断点状态、滚动上下文、校验
   postprocess/  标点规范化
   assemble/     EPUB/TXT 回填导出、QA 报告
 tests/          离线测试
+docs/           设计、状态契约、进度和未解决审计项
 ```
 
 ## 测试

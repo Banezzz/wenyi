@@ -48,7 +48,9 @@ class Translator(Agent):
         items = self._ask_json(system, user, tier="strong", key="translations")
         if not isinstance(items, list):
             raise AlignmentError("模型未返回译文数组")
-        return [str(x) for x in items]
+        if any(not isinstance(item, str) for item in items):
+            raise AlignmentError("译文数组包含非字符串项")
+        return items
 
     def _translate_one(self, source, glossary_terms, style, context,
                        book_synopsis, chapter_digest) -> str:
@@ -102,8 +104,8 @@ class Translator(Agent):
         )
         items = self._ask_json(system, user, tier="strong",
                                key="translations", default=None)
-        if isinstance(items, list) and items:
-            return str(items[0]).strip()
+        if isinstance(items, list) and items and isinstance(items[0], str):
+            return items[0].strip()
         return ""
 
     def translate_batch(
@@ -129,7 +131,7 @@ class Translator(Agent):
                                        book_synopsis, chapter_digest)
             except Exception:
                 out = []
-            if len(out) == n:
+            if len(out) == n and all(item.strip() for item in out):
                 return out
         # 兜底：逐段翻译，保证 1:1
         return [

@@ -64,6 +64,52 @@ class TestTranslatorAlignment(unittest.TestCase):
         out = t.translate_batch(["あ", "い"])
         self.assertEqual(out, ["", ""])
 
+    def test_aligned_response_with_empty_item_falls_back_per_segment(self):
+        def handler(messages, tier, json_mode):
+            n = _count_segments(messages[-1]["content"])
+            if n > 1:
+                return json.dumps(
+                    {"translations": ["批译"] + [""] * (n - 1)},
+                    ensure_ascii=False,
+                )
+            return json.dumps({"translations": ["单段补译"]}, ensure_ascii=False)
+
+        client = FakeClient(handler=handler)
+        out = Translator(client, self._config()).translate_batch(["あ", "い"])
+        self.assertEqual(out, ["单段补译", "单段补译"])
+        self.assertGreaterEqual(sum(
+            _count_segments(call["messages"][-1]["content"]) == 1
+            for call in client.calls
+        ), 2)
+
+    def test_non_string_translation_items_are_protocol_failures(self):
+        calls = 0
+
+        def handler(messages, tier, json_mode):
+            nonlocal calls
+            calls += 1
+            n = _count_segments(messages[-1]["content"])
+            if n > 1:
+                return json.dumps(
+                    {"translations": [None, {"bad": True}][:n]},
+                    ensure_ascii=False,
+                )
+            return json.dumps({"translations": ["单段安全译文"]}, ensure_ascii=False)
+
+        out = Translator(FakeClient(handler=handler), self._config()).translate_batch(
+            ["あ", "い"]
+        )
+        self.assertEqual(out, ["单段安全译文", "单段安全译文"])
+        self.assertGreaterEqual(calls, 4)
+
+    def test_retranslate_rejects_non_string_item(self):
+        client = FakeClient(handler=lambda m, t, j: json.dumps(
+            {"translations": [None]}, ensure_ascii=False))
+        out = Translator(client, self._config()).retranslate_with_feedback(
+            "原文", feedback="修复"
+        )
+        self.assertEqual(out, "")
+
 
 class TestChecks(unittest.TestCase):
     def test_count_aligned(self):

@@ -60,6 +60,15 @@ def _runstore_for(config: Config, input_path: str) -> RunStore:
     return RunStore(run_dir, create=False)
 
 
+def _open_glossary(store: RunStore):
+    """Open an existing run database and turn identity failures into CLI errors."""
+    try:
+        return store.open_glossary()
+    except Exception as exc:
+        console.print(f"[red]术语库状态无效：{exc}[/]")
+        raise typer.Exit(1) from exc
+
+
 def _translate_impl(
     input_path: str,
     *,
@@ -110,6 +119,16 @@ def _translate_impl(
         f"[bold green]完成[/]：{s['chapters_done']}/{s['chapters_total']} 章，"
         f"术语 {s['terms']}，一致性问题 {len(result['qa_issues'])} 项。"
     )
+    if s.get("glossary_pending"):
+        console.print(
+            f"[yellow]仍有 {s['glossary_pending']} 章术语抽取待续跑；"
+            "已完成译文不会重翻。[/]"
+        )
+    if s.get("titles_pending"):
+        console.print(
+            "[yellow]章节标题仍待按最新术语生成；本次导出使用源标题。"
+            "再次续跑会重试标题阶段。[/]"
+        )
     console.print(f"译文：[bold]{result['output']}[/]")
 
 
@@ -141,17 +160,26 @@ def translate(
 def resume(
     input: str = typer.Argument(..., help="输入文件"),
     fmt: str = typer.Option("epub", "--format", help="输出格式：epub | txt"),
+    out: Optional[str] = typer.Option(None, "--out", help="输出路径"),
+    polish: Optional[bool] = typer.Option(
+        None,
+        "--polish/--no-polish",
+        help="覆盖配置文件中的润色开关",
+    ),
+    qa: Optional[bool] = typer.Option(
+        None,
+        "--qa/--no-qa",
+        help="覆盖配置文件中的一致性 QA 开关",
+    ),
 ):
     """断点续跑（等价于再次 translate）。"""
-    _translate_impl(input, fmt=fmt)
+    _translate_impl(input, fmt=fmt, out=out, polish=polish, qa=qa)
 
 
 # ── 查询 / 细粒度命令 ──────────────────────────────────────────────────────
 @app.command()
 def status(input: str = typer.Argument(..., help="输入文件")):
     """查看各章进度与术语库统计。"""
-    from .glossary.store import GlossaryStore
-
     config = _load_config()
     store = _runstore_for(config, input)
     if not store.exists():
@@ -161,12 +189,18 @@ def status(input: str = typer.Argument(..., help="输入文件")):
     console.print(
         f"《{m['title']}》（{m['fmt']}）  {m['source_lang']}→{m['target_lang']}"
     )
-    table = Table("", "#", "章节", "状态")
+    table = Table("", "#", "章节", "翻译", "术语")
     for c in m["chapters"]:
         mark = "✓" if c["status"] == STATUS_DONE else "·"
-        table.add_row(mark, str(c["index"]), c["title"], c["status"])
+        table.add_row(
+            mark,
+            str(c["index"]),
+            c["title"],
+            c["status"],
+            c.get("glossary_status", "legacy"),
+        )
     console.print(table)
-    g = GlossaryStore(store.glossary_path)
+    g = _open_glossary(store)
     console.print("术语库：", g.stats())
     g.close()
 
@@ -182,14 +216,12 @@ def glossary(
 ):
     """术语库管理。audit 自动统一译法并改写正文。"""
     from .glossary import resolver
-    from .glossary.store import GlossaryStore
-
     config = _load_config()
     store = _runstore_for(config, input)
     if not store.exists():
         console.print("[yellow]尚无进度。先运行 translate。[/]")
         raise typer.Exit(1)
-    g = GlossaryStore(store.glossary_path)
+    g = _open_glossary(store)
     try:
         if action == "list":
             table = Table("原文", "译文", "类型", "置信/状态", "锁")
@@ -264,7 +296,6 @@ def assemble(
 def qa(input: str = typer.Argument(..., help="输入文件")):
     """全书跨章一致性扫描。"""
     from .agents.consistency import ConsistencyChecker
-    from .glossary.store import GlossaryStore
     from .llm.base import build_client
 
     config = _load_config()
@@ -272,7 +303,7 @@ def qa(input: str = typer.Argument(..., help="输入文件")):
     if not store.exists():
         console.print("[yellow]尚无进度。先运行 translate。[/]")
         raise typer.Exit(1)
-    g = GlossaryStore(store.glossary_path)
+    g = _open_glossary(store)
     issues = ConsistencyChecker(build_client(config), config).check(store, g)
     g.close()
     console.print(f"一致性问题 {len(issues)} 项：")
@@ -286,14 +317,12 @@ def qa(input: str = typer.Argument(..., help="输入文件")):
 def report(input: str = typer.Argument(..., help="输入文件")):
     """生成 QA 报告（漏译/冲突/低置信度汇总）。"""
     from .assemble.report import build_report
-    from .glossary.store import GlossaryStore
-
     config = _load_config()
     store = _runstore_for(config, input)
     if not store.exists():
         console.print("[yellow]尚无进度。先运行 translate。[/]")
         raise typer.Exit(1)
-    g = GlossaryStore(store.glossary_path)
+    g = _open_glossary(store)
     rep = build_report(store, g)
     g.close()
     store.save_report(rep)

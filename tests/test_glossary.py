@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
 
 from trans_novel.glossary.store import (
+    GlossaryCheckpoint,
     GlossaryStore,
+    GlossaryStoreIdentityError,
     GlossaryTerm,
     TYPE_APPELLATION,
     TYPE_PERSON,
+    TYPE_TERM,
 )
 
 
@@ -90,6 +94,189 @@ class TestGlossary(unittest.TestCase):
         term = self.store.get_term("X")
         assert term is not None
         self.assertEqual(term.target, "新译")
+
+    def test_from_mapping_normalizes_untrusted_values(self):
+        term = GlossaryTerm.from_mapping(
+            {
+                "source": "  source  ",
+                "target": "  target  ",
+                "reading": ["not-bindable"],
+                "type": {"not": "a string"},
+                "gender": " Unknown ",
+                "aliases": [" first ", "", None, "first", "second", 7],
+                "note": 7,
+            },
+            first_chapter=4,
+        )
+        assert term is not None
+        self.assertEqual(term.source, "source")
+        self.assertEqual(term.target, "target")
+        self.assertEqual(term.reading, "")
+        self.assertEqual(term.type, TYPE_TERM)
+        self.assertEqual(term.gender, "")
+        self.assertEqual(term.aliases, ["first", "second"])
+        self.assertEqual(term.note, "")
+        self.assertEqual(term.first_chapter, 4)
+
+        person = GlossaryTerm.from_mapping(
+            {"source": "A", "target": "甲", "type": "组织", "gender": "未知"},
+            type_override=TYPE_PERSON,
+        )
+        assert person is not None
+        self.assertEqual(person.type, TYPE_PERSON)
+        self.assertEqual(person.gender, "")
+
+    def test_from_mapping_rejects_invalid_required_values(self):
+        invalid_values = (None, 7, ["value"], {"value": "x"}, "   ")
+        for value in invalid_values:
+            with self.subTest(source=value):
+                self.assertIsNone(
+                    GlossaryTerm.from_mapping({"source": value, "target": "valid"})
+                )
+            with self.subTest(target=value):
+                self.assertIsNone(
+                    GlossaryTerm.from_mapping({"source": "valid", "target": value})
+                )
+
+    def test_from_row_normalizes_legacy_gender_and_aliases(self):
+        self.store.conn.execute(
+            """INSERT INTO glossary
+               (source,target,type,gender,aliases,locked,status,updated_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                "legacy",
+                "旧译",
+                None,
+                "未知",
+                json.dumps([" alias ", 7, "alias", "second"]),
+                0,
+                None,
+                0.0,
+            ),
+        )
+        self.store.conn.commit()
+
+        term = self.store.get_term("legacy")
+        assert term is not None
+        self.assertEqual(term.type, TYPE_TERM)
+        self.assertEqual(term.gender, "")
+        self.assertEqual(term.aliases, ["alias", "second"])
+        self.assertEqual(term.status, "ok")
+
+    def test_upsert_rejects_non_bindable_types_before_sqlite(self):
+        invalid_terms = [
+            ("type", GlossaryTerm(source="A", target="甲", type=["术语"])),
+            ("reading", GlossaryTerm(source="B", target="乙", reading={"x": 1})),
+            ("aliases", GlossaryTerm(source="C", target="丙", aliases=["ok", 7])),
+            ("first_chapter", GlossaryTerm(source="D", target="丁", first_chapter=[])),
+        ]
+        for field_name, term in invalid_terms:
+            with self.subTest(field=field_name):
+                with self.assertRaisesRegex(TypeError, field_name):
+                    self.store.upsert_term(term, chapter=1)
+        with self.assertRaisesRegex(TypeError, "chapter"):
+            self.store.upsert_term(GlossaryTerm(source="E", target="戊"), chapter=[])
+        self.assertEqual(self.store.stats()["terms"], 0)
+
+    def test_bulk_upsert_prevalidates_every_term(self):
+        checkpoint = GlossaryCheckpoint("batch", 2, 10, 2, "batch-fingerprint")
+        valid = GlossaryTerm(source="valid", target="有效")
+        invalid = GlossaryTerm(source="invalid", target="无效", note=["bad"])
+
+        with self.assertRaisesRegex(TypeError, "note"):
+            self.store.upsert_terms(
+                [valid, invalid], chapter=2, checkpoint=checkpoint
+            )
+        self.assertIsNone(self.store.get_term("valid"))
+        self.assertFalse(self.store.checkpoint_matches(checkpoint))
+
+    def test_checkpoint_update_and_generation_persistence(self):
+        checkpoint = GlossaryCheckpoint("batch", 3, 5, 2, "fingerprint-a")
+        summary = self.store.upsert_terms(
+            [GlossaryTerm(source="A", target="甲")],
+            chapter=3,
+            checkpoint=checkpoint,
+        )
+        self.assertEqual(
+            summary,
+            {"inserted": 1, "updated": 0, "conflict": 0, "unchanged": 0},
+        )
+        self.assertTrue(self.store.checkpoint_matches(checkpoint))
+
+        replacement = GlossaryCheckpoint("batch", 3, 5, 3, "fingerprint-b", version=2)
+        self.store.record_checkpoint(replacement)
+        self.assertFalse(self.store.checkpoint_matches(checkpoint))
+        self.assertTrue(self.store.checkpoint_matches(replacement))
+        count = self.store.conn.execute(
+            "SELECT COUNT(*) FROM glossary_extraction_checkpoints"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+        generation_id = self.store.generation_id
+        db_path = self.store.db_path
+        self.store.close()
+        self.store = GlossaryStore(db_path)
+        self.assertEqual(self.store.generation_id, generation_id)
+        self.assertTrue(self.store.checkpoint_matches(replacement))
+
+    def test_existing_store_open_fails_closed_on_missing_or_wrong_generation(self):
+        db_path = self.store.db_path
+        generation_id = self.store.generation_id
+        self.store.close()
+
+        reopened = GlossaryStore(
+            db_path,
+            create=False,
+            expected_generation_id=generation_id,
+        )
+        reopened.close()
+
+        with self.assertRaisesRegex(GlossaryStoreIdentityError, "mismatch"):
+            GlossaryStore(
+                db_path,
+                create=False,
+                expected_generation_id="not-the-owned-generation",
+            )
+
+        os.remove(db_path)
+        with self.assertRaisesRegex(FileNotFoundError, "missing"):
+            GlossaryStore(db_path, create=False)
+        self.assertFalse(os.path.exists(db_path))
+
+        # tearDown expects an open store; use an unrelated temporary database.
+        self.store = GlossaryStore(db_path)
+
+    def test_bulk_upsert_rolls_back_terms_conflicts_and_checkpoint(self):
+        self.store.upsert_term(
+            GlossaryTerm(source="locked", target="canonical", confidence="high"),
+            chapter=0,
+        )
+        self.store.lock_term("locked")
+        checkpoint = GlossaryCheckpoint("batch", 4, 0, 2, "rollback-test")
+        self.store.conn.execute(
+            """CREATE TRIGGER fail_checkpoint BEFORE INSERT
+               ON glossary_extraction_checkpoints
+               BEGIN SELECT RAISE(ABORT, 'checkpoint failure'); END"""
+        )
+        self.store.conn.commit()
+
+        with self.assertRaisesRegex(Exception, "checkpoint failure"):
+            self.store.upsert_terms(
+                [
+                    GlossaryTerm(source="locked", target="proposal"),
+                    GlossaryTerm(source="new", target="新译"),
+                ],
+                chapter=4,
+                checkpoint=checkpoint,
+            )
+
+        locked = self.store.get_term("locked")
+        assert locked is not None
+        self.assertEqual(locked.target, "canonical")
+        self.assertEqual(locked.status, "ok")
+        self.assertEqual(self.store.open_conflicts(), [])
+        self.assertIsNone(self.store.get_term("new"))
+        self.assertFalse(self.store.checkpoint_matches(checkpoint))
 
     def test_translation_memory(self):
         self.store.add_tm("風が強かった。", "风很大。", chapter=1)

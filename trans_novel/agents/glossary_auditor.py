@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..glossary.store import GlossaryStore, GlossaryTerm, TYPE_PERSON
-from ..pipeline.runstore import RunStore
+from ..pipeline.runstore import GLOSSARY_PENDING, RunStore
 from . import prompts
 from .base import Agent
 
@@ -93,8 +93,46 @@ class GlossaryAuditor(Agent):
         system = prompts.render("glossary_audit_system", src=self.src, tgt=self.tgt)
         uni = self._ask_json(system, user, tier="strong",
                              key="unifications", default=[])
-        return [u for u in self.dict_items(uni)
-                if u.get("source") and u.get("canonical")]
+        normalized: list[dict[str, Any]] = []
+        for item in self.dict_items(uni):
+            source = item.get("source")
+            canonical = item.get("canonical")
+            if (
+                not isinstance(source, str)
+                or source not in candidates
+                or not isinstance(canonical, str)
+                or not canonical.strip()
+            ):
+                continue
+            source = source.strip()
+            canonical = canonical.strip()
+            candidate = candidates[source]
+            allowed = {
+                value.strip()
+                for value in [candidate["current"], *candidate["variants"]]
+                if isinstance(value, str) and value.strip()
+            }
+            if canonical not in allowed:
+                continue
+            raw_variants = item.get("variants")
+            variants = []
+            if isinstance(raw_variants, list):
+                variants = [
+                    value.strip()
+                    for value in raw_variants
+                    if isinstance(value, str)
+                    and value.strip() in allowed
+                    and value.strip() != canonical
+                ]
+            variants = list(dict.fromkeys(variants))
+            reason = item.get("reason")
+            normalized.append({
+                "source": source,
+                "canonical": canonical,
+                "variants": variants,
+                "reason": reason.strip() if isinstance(reason, str) else "",
+            })
+        return normalized
 
     # ── 落地 ────────────────────────────────────────────────────────────────
     def audit(self, store: RunStore, glossary: GlossaryStore) -> list[dict[str, Any]]:
@@ -105,12 +143,9 @@ class GlossaryAuditor(Agent):
         # 收集 变体→规范 的全局替换表（仅汉字变体，避免误伤）
         replace_map: dict[str, str] = {}
         for u in unifications:
-            src = str(u["source"])
-            canonical = str(u["canonical"]).strip()
-            variants = [str(v).strip() for v in u.get("variants", []) if str(v).strip()]
-            variants = [v for v in variants if v and v != canonical]
-            if not canonical:
-                continue
+            src = u["source"]
+            canonical = u["canonical"]
+            variants = u["variants"]
             # 术语表：锁定 canonical，变体并入别名，标记冲突已解决
             glossary.lock_term(src, canonical)
             if variants:
@@ -123,7 +158,7 @@ class GlossaryAuditor(Agent):
                 if _is_cjk(v):           # 仅对汉字变体做正文替换，安全
                     replace_map[v] = canonical
             applied.append({"source": src, "canonical": canonical,
-                            "variants": variants, "reason": u.get("reason", "")})
+                            "variants": variants, "reason": u["reason"]})
 
         if replace_map:
             self._rewrite_targets(store, glossary, replace_map)
@@ -146,6 +181,8 @@ class GlossaryAuditor(Agent):
 
         m = store.load_manifest()
         changed = 0
+        man_dirty = False
+        targets_dirty = False
         for c in m["chapters"]:
             ch = store.load_chapter(c["index"])
             dirty = False
@@ -170,9 +207,35 @@ class GlossaryAuditor(Agent):
                     )
             if dirty:
                 store.save_chapter(ch)
+                targets_dirty = True
+                if c.get("glossary_status") != GLOSSARY_PENDING:
+                    c["glossary_status"] = GLOSSARY_PENDING
+                    man_dirty = True
+                c.pop("glossary_legacy", None)
+                if m.get("titles_status") != "pending":
+                    m["titles_status"] = "pending"
+                    man_dirty = True
+                store.log_event(
+                    "glossary_checkpoint_invalidated",
+                    chapter=c["index"],
+                    reason="target_rewritten",
+                )
+
+        if targets_dirty:
+            m["titles_status"] = "pending"
+            m.pop("title_translated", None)
+            for chapter in m.get("chapters", []):
+                if isinstance(chapter, dict):
+                    chapter.pop("title_translated", None)
+            meta = m.get("meta")
+            toc_entries = meta.get("toc_entries") if isinstance(meta, dict) else None
+            if isinstance(toc_entries, list):
+                for entry in toc_entries:
+                    if isinstance(entry, dict):
+                        entry.pop("title_translated", None)
+            man_dirty = True
 
         # 同步改写已译的章节标题，保持目录一致；书名保持原文，清理旧译名字段。
-        man_dirty = False
         if "title_translated" in m:
             old_title = m.pop("title_translated")
             man_dirty = True

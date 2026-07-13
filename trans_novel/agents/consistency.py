@@ -65,13 +65,20 @@ class ConsistencyChecker(Agent):
         raw = self._ask_json(system, user, tier="strong", key="replacements", default=[])
         replace_map: dict[str, str] = {}
         applied: list[dict] = []
-        for r in raw:
-            if not isinstance(r, dict):
+        for r in self.dict_items(raw):
+            wrong_value = r.get("wrong")
+            right_value = r.get("right")
+            if not isinstance(wrong_value, str) or not isinstance(right_value, str):
                 continue
-            wrong = str(r.get("wrong", "")).strip()
-            right = str(r.get("right", "")).strip()
+            wrong = wrong_value.strip()
+            right = right_value.strip()
             if wrong and right and wrong != right:
                 replace_map[wrong] = right
-                applied.append({"wrong": wrong, "right": right, "reason": r.get("reason", "")})
+                reason = r.get("reason")
+                applied.append({
+                    "wrong": wrong,
+                    "right": right,
+                    "reason": reason.strip() if isinstance(reason, str) else "",
+                })
         rewritten = GlossaryAuditor._rewrite_targets(store, glossary, replace_map) if replace_map else 0
         return {"replacements": applied, "rewritten": rewritten}

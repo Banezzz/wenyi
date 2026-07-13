@@ -13,6 +13,10 @@ from . import prompts
 from .base import Agent
 
 
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
 class Analyzer(Agent):
     def analyze(self, sample_text: str) -> dict[str, Any]:
         system = prompts.render("analyzer_system", src=self.src, tgt=self.tgt)
@@ -22,68 +26,67 @@ class Analyzer(Agent):
         data = self._ask_json(system, user, tier="strong")
         if not isinstance(data, dict):
             data = {}
-        data.setdefault("content_type", "")
-        data.setdefault("genre", "")
-        data.setdefault("tone", "")
-        data.setdefault("style_guide", "")
-        for key in ("narration", "pacing", "register", "dialogue_style", "rhetoric"):
-            data.setdefault(key, "")
-        data.setdefault("characters", [])
-        data.setdefault("terms", [])
+        for key in (
+            "content_type", "genre", "tone", "style_guide", "narration",
+            "pacing", "register", "dialogue_style", "rhetoric",
+        ):
+            data[key] = _text(data.get(key))
+        data["characters"] = self.dict_items(data.get("characters"))
+        data["terms"] = self.dict_items(data.get("terms"))
         return data
 
     def seed_glossary(self, store: GlossaryStore, analysis: dict[str, Any]) -> int:
         """把分析得到的角色/术语种入术语库，返回写入条目数。"""
-        count = 0
-        for ch in analysis.get("characters", []):
-            if not ch.get("source") or not ch.get("target"):
-                continue
-            store.upsert_term(
-                GlossaryTerm(
-                    source=ch["source"], target=ch["target"],
-                    reading=ch.get("reading", ""), type=TYPE_PERSON,
-                    gender=ch.get("gender", ""), note=ch.get("note", ""),
-                    confidence="medium", first_chapter=0,
-                ),
-                chapter=0,
+        terms: list[GlossaryTerm] = []
+        for ch in self.dict_items(analysis.get("characters")):
+            term = GlossaryTerm.from_mapping(
+                ch,
+                type_override=TYPE_PERSON,
+                confidence="medium",
+                first_chapter=0,
             )
-            count += 1
-        for tm in analysis.get("terms", []):
-            if not tm.get("source") or not tm.get("target"):
+            if term is None:
                 continue
-            store.upsert_term(
-                GlossaryTerm(
-                    source=tm["source"], target=tm["target"],
-                    reading=tm.get("reading", ""), type=tm.get("type", "术语"),
-                    note=tm.get("note", ""), confidence="medium", first_chapter=0,
-                ),
-                chapter=0,
+            terms.append(term)
+        for tm in self.dict_items(analysis.get("terms")):
+            term = GlossaryTerm.from_mapping(
+                tm,
+                confidence="medium",
+                first_chapter=0,
             )
-            count += 1
-        return count
+            if term is None:
+                continue
+            terms.append(term)
+        summary = store.upsert_terms(terms, chapter=0, checkpoint=None)
+        return sum(summary.values())
 
     def style_brief(self, analysis: dict[str, Any]) -> str:
         """把分析结果浓缩成给译者注入的风格/角色简报。"""
         lines = []
-        if analysis.get("content_type"):
-            lines.append(f"文本类型：{analysis['content_type']}")
-        if analysis.get("genre"):
-            lines.append(f"体裁：{analysis['genre']}")
-        if analysis.get("tone"):
-            lines.append(f"语气文体：{analysis['tone']}")
-        if analysis.get("style_guide"):
-            lines.append(f"风格指南：{analysis['style_guide']}")
+        for key, tag in (
+            ("content_type", "文本类型"), ("genre", "体裁"),
+            ("tone", "语气文体"), ("style_guide", "风格指南"),
+        ):
+            value = _text(analysis.get(key))
+            if value:
+                lines.append(f"{tag}：{value}")
         # 细粒度风格维度（旧 analysis.json 缺字段时自动跳过，向后兼容）
         for key, tag in (("narration", "叙事"), ("pacing", "句式节奏"),
                          ("register", "语域"), ("dialogue_style", "对话风格"),
                          ("rhetoric", "修辞")):
-            if analysis.get(key):
-                lines.append(f"{tag}：{analysis[key]}")
-        chars = analysis.get("characters", [])
+            value = _text(analysis.get(key))
+            if value:
+                lines.append(f"{tag}：{value}")
+        chars = self.dict_items(analysis.get("characters"))
         if chars:
             lines.append("角色：")
             for c in chars:
-                g = f"，{c.get('gender')}" if c.get("gender") else ""
-                note = f"，{c.get('note')}" if c.get("note") else ""
-                lines.append(f"  - {c.get('target', c.get('source',''))}({c.get('source','')}{g}{note})")
+                term = GlossaryTerm.from_mapping(c, type_override=TYPE_PERSON)
+                if term is None:
+                    continue
+                gender = f"，{term.gender}" if term.gender else ""
+                note = f"，{term.note}" if term.note else ""
+                lines.append(
+                    f"  - {term.target}({term.source}{gender}{note})"
+                )
         return "\n".join(lines)
