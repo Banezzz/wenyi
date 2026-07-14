@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import zipfile
 
@@ -110,9 +111,20 @@ def _render_chapter_html(chapter: Chapter) -> str:
     return str(soup)
 
 
-def _base_no_frag(href: str) -> str:
-    """取 href 的文件名（去目录、去 #锚点），用于跨文件相对路径匹配。"""
-    return os.path.basename((href or "").split("#", 1)[0])
+def _zip_document_path(base_path: str, href: str) -> str:
+    """Resolve an EPUB-relative href to a normalized archive document path."""
+    clean = (href or "").split("#", 1)[0].split("?", 1)[0]
+    if not clean:
+        return posixpath.normpath(base_path) if base_path else ""
+    clean = clean.lstrip("/")
+    base_dir = posixpath.dirname(base_path)
+    resolved = posixpath.join(base_dir, clean) if base_dir else clean
+    normalized = posixpath.normpath(resolved)
+    return "" if normalized == "." else normalized
+
+
+def _normalized_title(value: str) -> str:
+    return " ".join((value or "").split())
 
 
 def _attr_str(value: object) -> str:
@@ -125,6 +137,8 @@ def _rewrite_opf_metadata(
     book_title: str,
     lang: str,
     force_horizontal: bool,
+    opf_path: str = "",
+    title_rewrites: dict[tuple[str, str], str] | None = None,
 ) -> bytes:
     """更新 OPF 元数据：书名可选改写，译后语言改为目标语言，竖排源书改横排方向。"""
     try:
@@ -148,6 +162,20 @@ def _rewrite_opf_metadata(
         if force_horizontal:
             for spine in soup.find_all("spine"):
                 spine["page-progression-direction"] = "ltr"
+
+        if title_rewrites:
+            used: set[tuple[str, str]] = set()
+            for reference in soup.find_all("reference"):
+                href = _attr_str(reference.get("href"))
+                source = _attr_str(reference.get("title"))
+                key = (
+                    _zip_document_path(opf_path, href),
+                    _normalized_title(source),
+                )
+                title = "" if key in used else title_rewrites.get(key, "")
+                if title:
+                    reference["title"] = title
+                    used.add(key)
         return soup.encode()
     except Exception:
         return data
@@ -168,7 +196,13 @@ def _epub_looks_vertical(zf: zipfile.ZipFile) -> bool:
     return False
 
 
-def _rewrite_html_document(data: bytes | str, *, lang: str, force_horizontal: bool) -> bytes:
+def _rewrite_html_document(
+    data: bytes | str,
+    *,
+    lang: str,
+    force_horizontal: bool,
+    document_title: str = "",
+) -> bytes:
     """给 XHTML/HTML 写入译后语言；必要时注入横排覆盖样式。"""
     try:
         text = data.decode("utf-8") if isinstance(data, bytes) else data
@@ -181,6 +215,18 @@ def _rewrite_html_document(data: bytes | str, *, lang: str, force_horizontal: bo
         classes = html.get("class")
         if isinstance(classes, list) and "vrtl" in classes:
             html["class"] = [c for c in classes if c != "vrtl"]
+
+        if document_title:
+            head = soup.find("head")
+            if head is None:
+                head = soup.new_tag("head")
+                html.insert(0, head)
+            title = head.find("title")
+            if title is None:
+                title = soup.new_tag("title")
+                head.insert(0, title)
+            title.clear()
+            title.append(document_title)
 
         if force_horizontal and soup.find(id=_HORIZONTAL_OVERRIDE_ID) is None:
             head = soup.find("head")
@@ -209,17 +255,44 @@ def _rewrite_html_document(data: bytes | str, *, lang: str, force_horizontal: bo
         return data if isinstance(data, bytes) else data.encode("utf-8")
 
 
-def _rewrite_toc(data: bytes, title_by_base: dict[str, str], *, is_ncx: bool) -> bytes:
-    """把目录（NCX navLabel / NAV 的 <a>）标题文本改为译名，按 href 文件名匹配。"""
+def _rewrite_toc(
+    data: bytes,
+    title_rewrites: dict[tuple[str, str], str],
+    *,
+    is_ncx: bool,
+    toc_path: str = "",
+    lang: str = "",
+) -> bytes:
+    """Rewrite tracked TOC labels without flattening fragment-level children."""
     try:
+        used: set[tuple[str, str]] = set()
+
+        def translated(href: str, source: str) -> str:
+            key = (
+                _zip_document_path(toc_path, href),
+                _normalized_title(source),
+            )
+            if key in used:
+                return ""
+            target = title_rewrites.get(key, "")
+            if target:
+                used.add(key)
+            return target
+
         if is_ncx:
             soup = BeautifulSoup(data, "xml")
+            root = soup.find("ncx")
+            if root is not None and lang:
+                root["xml:lang"] = lang
             for np in soup.find_all("navPoint"):
                 content = np.find("content")
                 label = np.find("text")
                 if content is None or label is None:
                     continue
-                t = title_by_base.get(_base_no_frag(_attr_str(content.get("src"))))
+                t = translated(
+                    _attr_str(content.get("src")),
+                    label.get_text(" ", strip=True),
+                )
                 if t:
                     label.clear()
                     label.append(t)
@@ -232,7 +305,10 @@ def _rewrite_toc(data: bytes, title_by_base: dict[str, str], *, is_ncx: bool) ->
         scopes = toc_navs or [soup]  # 找不到带类型的 toc nav 时退回全局
         for scope in scopes:
             for a in scope.find_all("a", href=True):
-                t = title_by_base.get(_base_no_frag(_attr_str(a.get("href"))))
+                t = translated(
+                    _attr_str(a.get("href")),
+                    a.get_text(" ", strip=True),
+                )
                 if t:
                     a.clear()
                     a.append(t)
@@ -251,13 +327,9 @@ def _assemble_epub(store: RunStore, source_path: str, out_path: str) -> str:
         if ch.href and ch.template:
             rendered[ch.href] = _render_chapter_html(ch)
 
-    # 目录标题映射（文件名 → 译名）；书名保持原文，不改 OPF 主标题。
-    title_by_base: dict[str, str] = {}
-    for c in m["chapters"]:
-        base = _base_no_frag(c.get("href") or "")
-        t = _ch_title(c)
-        if base and t:
-            title_by_base[base] = t
+    # 只用真实译名建立精确规则；原文 fallback 不能覆盖章节译名。
+    title_rewrites: dict[tuple[str, str], str] = {}
+    document_titles: dict[str, str] = {}
     raw_meta = m.get("meta")
     meta = raw_meta if isinstance(raw_meta, dict) else {}
     raw_toc_entries = meta.get("toc_entries", [])
@@ -266,11 +338,26 @@ def _assemble_epub(store: RunStore, source_path: str, out_path: str) -> str:
         if not isinstance(entry, dict):
             continue
         href = entry.get("href")
-        title_value = entry.get("title_translated") or entry.get("title")
-        base = _base_no_frag(href if isinstance(href, str) else "")
-        title = title_value.strip() if isinstance(title_value, str) else ""
-        if base and title:
-            title_by_base[base] = title
+        source = entry.get("title")
+        target = entry.get("title_translated")
+        path = _zip_document_path("", href if isinstance(href, str) else "")
+        if path and isinstance(source, str) and isinstance(target, str) and target.strip():
+            title_rewrites.setdefault(
+                (path, _normalized_title(source)),
+                target.strip(),
+            )
+            document_titles.setdefault(path, target.strip())
+    for c in m["chapters"]:
+        href = c.get("href")
+        source = c.get("title")
+        target = c.get("title_translated")
+        path = _zip_document_path("", href if isinstance(href, str) else "")
+        if path and isinstance(source, str) and isinstance(target, str) and target.strip():
+            title_rewrites.setdefault(
+                (path, _normalized_title(source)),
+                target.strip(),
+            )
+            document_titles.setdefault(path, target.strip())
     book_title = ""
 
     with zipfile.ZipFile(source_path, "r") as zin:
@@ -288,6 +375,9 @@ def _assemble_epub(store: RunStore, source_path: str, out_path: str) -> str:
                             rendered[name],
                             lang=target_lang,
                             force_horizontal=force_horizontal,
+                            document_title=document_titles.get(
+                                _zip_document_path("", name), ""
+                            ),
                         ),
                     )
                 elif name == "mimetype":
@@ -300,19 +390,38 @@ def _assemble_epub(store: RunStore, source_path: str, out_path: str) -> str:
                             book_title=book_title,
                             lang=target_lang,
                             force_horizontal=force_horizontal,
+                            opf_path=name,
+                            title_rewrites=title_rewrites,
                         ),
                     )
                 elif low.endswith(".ncx"):
-                    zout.writestr(info, _rewrite_toc(data, title_by_base, is_ncx=True))
+                    zout.writestr(
+                        info,
+                        _rewrite_toc(
+                            data,
+                            title_rewrites,
+                            is_ncx=True,
+                            toc_path=name,
+                            lang=target_lang,
+                        ),
+                    )
                 elif low.endswith(_HTML_EXTS):
                     if _is_nav(data):
-                        data = _rewrite_toc(data, title_by_base, is_ncx=False)
+                        data = _rewrite_toc(
+                            data,
+                            title_rewrites,
+                            is_ncx=False,
+                            toc_path=name,
+                        )
                     zout.writestr(
                         info,
                         _rewrite_html_document(
                             data,
                             lang=target_lang,
                             force_horizontal=force_horizontal,
+                            document_title=document_titles.get(
+                                _zip_document_path("", name), ""
+                            ),
                         ),
                     )
                 else:
