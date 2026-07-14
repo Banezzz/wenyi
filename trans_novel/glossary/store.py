@@ -6,6 +6,7 @@
 - term_conflicts：待裁决的译法冲突日志，供人工复核。
 - translation_memory：句群级译文对，供一致性参考与重译复用。
 - glossary_extraction_checkpoints：术语抽取完成点，和批量术语写入原子提交。
+- glossary_chapter_window_checkpoints：绑定章级计划的窗口抽取完成点。
 - store_metadata：术语库世代标识，防止旧 checkpoint 被错误复用。
 """
 
@@ -157,18 +158,42 @@ class GlossaryCheckpoint:
     count: int
     fingerprint: str
     version: int = 1
+    plan_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, str):
             raise TypeError("checkpoint.scope must be a string")
-        if self.scope not in {"batch", "chapter"}:
-            raise ValueError("checkpoint scope must be 'batch' or 'chapter'")
+        if self.scope not in {"batch", "chapter", "chapter_window"}:
+            raise ValueError(
+                "checkpoint scope must be 'batch', 'chapter', or 'chapter_window'"
+            )
         _validate_int("checkpoint.chapter", self.chapter, minimum=0)
         _validate_int("checkpoint.start_index", self.start_index, minimum=0)
         _validate_int("checkpoint.count", self.count, minimum=0)
         _validate_int("checkpoint.version", self.version, minimum=1)
         if _nonempty_string(self.fingerprint) is None:
             raise ValueError("checkpoint.fingerprint must be a non-empty string")
+        if not isinstance(self.plan_fingerprint, str):
+            raise TypeError("checkpoint.plan_fingerprint must be a string")
+        plan_fingerprint = self.plan_fingerprint.strip()
+        if plan_fingerprint != self.plan_fingerprint:
+            raise ValueError(
+                "checkpoint.plan_fingerprint cannot contain outer whitespace"
+            )
+        if self.scope == "chapter_window" and self.count == 0:
+            raise ValueError("chapter window checkpoint count must be positive")
+        if self.scope == "chapter_window" or (
+            self.scope == "chapter" and self.version >= 2
+        ):
+            if not plan_fingerprint:
+                raise ValueError(
+                    "chapter window and v2 chapter checkpoints require "
+                    "plan_fingerprint"
+                )
+        elif plan_fingerprint:
+            raise ValueError(
+                "batch and v1 chapter checkpoints cannot bind plan_fingerprint"
+            )
 
 
 def _nonempty_string(value: Any) -> str | None:
@@ -247,7 +272,22 @@ CREATE TABLE IF NOT EXISTS glossary_extraction_checkpoints (
     updated_at    REAL NOT NULL,
     PRIMARY KEY (scope, chapter, start_index)
 );
+CREATE TABLE IF NOT EXISTS glossary_chapter_window_checkpoints (
+    chapter          INTEGER NOT NULL CHECK(chapter >= 0),
+    start_index      INTEGER NOT NULL CHECK(start_index >= 0),
+    count            INTEGER NOT NULL CHECK(count > 0),
+    fingerprint      TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+    plan_fingerprint TEXT NOT NULL,
+    generation_id    TEXT NOT NULL,
+    updated_at       REAL NOT NULL,
+    PRIMARY KEY (chapter, start_index)
+);
 """
+
+_DERIVED_CHAPTER_CHECKPOINT_DOMAIN = (
+    "trans-novel/glossary-derived-chapter-checkpoint/v2"
+)
 
 
 def _hash(text: str) -> str:
@@ -361,13 +401,14 @@ class GlossaryStore:
             self._validate_term_for_storage(term)
 
         summary = {"inserted": 0, "updated": 0, "conflict": 0, "unchanged": 0}
+        self._require_no_active_transaction("upsert glossary terms")
         try:
-            self.conn.execute("BEGIN")
+            self.conn.execute("BEGIN IMMEDIATE")
             for term in materialized:
                 result = self._upsert_term(term, chapter)
                 summary[result] += 1
             if checkpoint is not None:
-                self.record_checkpoint(checkpoint, commit=False)
+                self._write_checkpoint(checkpoint)
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -475,20 +516,90 @@ class GlossaryStore:
         if not isinstance(checkpoint, GlossaryCheckpoint):
             raise TypeError("checkpoint must be a GlossaryCheckpoint")
 
+    def _require_no_active_transaction(self, operation: str) -> None:
+        if self.conn.in_transaction:
+            raise RuntimeError(f"cannot {operation} inside an active transaction")
+
     def checkpoint_matches(self, checkpoint: GlossaryCheckpoint) -> bool:
         self._validate_checkpoint(checkpoint)
-        row = self.conn.execute(
-            """SELECT count, fingerprint, version, generation_id
-               FROM glossary_extraction_checkpoints
-               WHERE scope=? AND chapter=? AND start_index=?""",
-            (checkpoint.scope, checkpoint.chapter, checkpoint.start_index),
-        ).fetchone()
+        return self._checkpoint_matches(checkpoint)
+
+    def _checkpoint_matches(self, checkpoint: GlossaryCheckpoint) -> bool:
+        if checkpoint.scope == "chapter_window":
+            row = self.conn.execute(
+                """SELECT count, fingerprint, version, plan_fingerprint,
+                          generation_id
+                   FROM glossary_chapter_window_checkpoints
+                   WHERE chapter=? AND start_index=?""",
+                (checkpoint.chapter, checkpoint.start_index),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """SELECT count, fingerprint, version, generation_id
+                   FROM glossary_extraction_checkpoints
+                   WHERE scope=? AND chapter=? AND start_index=?""",
+                (checkpoint.scope, checkpoint.chapter, checkpoint.start_index),
+            ).fetchone()
         return bool(
             row
             and row["count"] == checkpoint.count
             and row["fingerprint"] == checkpoint.fingerprint
             and row["version"] == checkpoint.version
             and row["generation_id"] == self.generation_id
+            and (
+                checkpoint.scope != "chapter_window"
+                or row["plan_fingerprint"] == checkpoint.plan_fingerprint
+            )
+        )
+
+    def _write_checkpoint(self, checkpoint: GlossaryCheckpoint) -> None:
+        self._validate_checkpoint(checkpoint)
+        if checkpoint.scope == "chapter_window":
+            self.conn.execute(
+                """INSERT INTO glossary_chapter_window_checkpoints
+                   (chapter,start_index,count,fingerprint,version,
+                    plan_fingerprint,generation_id,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(chapter,start_index) DO UPDATE SET
+                       count=excluded.count,
+                       fingerprint=excluded.fingerprint,
+                       version=excluded.version,
+                       plan_fingerprint=excluded.plan_fingerprint,
+                       generation_id=excluded.generation_id,
+                       updated_at=excluded.updated_at""",
+                (
+                    checkpoint.chapter,
+                    checkpoint.start_index,
+                    checkpoint.count,
+                    checkpoint.fingerprint,
+                    checkpoint.version,
+                    checkpoint.plan_fingerprint,
+                    self.generation_id,
+                    time.time(),
+                ),
+            )
+            return
+        self.conn.execute(
+            """INSERT INTO glossary_extraction_checkpoints
+               (scope,chapter,start_index,count,fingerprint,version,
+                generation_id,updated_at)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(scope,chapter,start_index) DO UPDATE SET
+                   count=excluded.count,
+                   fingerprint=excluded.fingerprint,
+                   version=excluded.version,
+                   generation_id=excluded.generation_id,
+                   updated_at=excluded.updated_at""",
+            (
+                checkpoint.scope,
+                checkpoint.chapter,
+                checkpoint.start_index,
+                checkpoint.count,
+                checkpoint.fingerprint,
+                checkpoint.version,
+                self.generation_id,
+                time.time(),
+            ),
         )
 
     def record_checkpoint(
@@ -498,35 +609,326 @@ class GlossaryStore:
         commit: bool = True,
     ) -> None:
         self._validate_checkpoint(checkpoint)
+        if not commit:
+            if not self.conn.in_transaction:
+                raise RuntimeError(
+                    "record_checkpoint(commit=False) requires an active transaction"
+                )
+            self._write_checkpoint(checkpoint)
+            return
+
+        self._require_no_active_transaction("record a checkpoint")
         try:
-            self.conn.execute(
-                """INSERT INTO glossary_extraction_checkpoints
-                   (scope,chapter,start_index,count,fingerprint,version,
-                    generation_id,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?)
-                   ON CONFLICT(scope,chapter,start_index) DO UPDATE SET
-                       count=excluded.count,
-                       fingerprint=excluded.fingerprint,
-                       version=excluded.version,
-                       generation_id=excluded.generation_id,
-                       updated_at=excluded.updated_at""",
-                (
-                    checkpoint.scope,
-                    checkpoint.chapter,
-                    checkpoint.start_index,
-                    checkpoint.count,
-                    checkpoint.fingerprint,
-                    checkpoint.version,
-                    self.generation_id,
-                    time.time(),
-                ),
-            )
-            if commit:
-                self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+            self._write_checkpoint(checkpoint)
+            self.conn.commit()
         except Exception:
-            if commit:
-                self.conn.rollback()
+            self.conn.rollback()
             raise
+
+    @staticmethod
+    def _checkpoint_identity(checkpoint: GlossaryCheckpoint) -> dict[str, Any]:
+        return {
+            "scope": checkpoint.scope,
+            "chapter": checkpoint.chapter,
+            "start_index": checkpoint.start_index,
+            "count": checkpoint.count,
+            "fingerprint": checkpoint.fingerprint,
+            "version": checkpoint.version,
+            "plan_fingerprint": checkpoint.plan_fingerprint,
+        }
+
+    def _prepare_derived_chapter_inputs(
+        self,
+        *,
+        chapter: int,
+        plan_fingerprint: str,
+        batch_checkpoints: Iterable[GlossaryCheckpoint],
+        window_checkpoints: Iterable[GlossaryCheckpoint],
+    ) -> tuple[
+        tuple[GlossaryCheckpoint, ...],
+        tuple[GlossaryCheckpoint, ...],
+        str,
+        int,
+    ]:
+        self._validate_chapter(chapter, allow_none=False)
+        if not isinstance(plan_fingerprint, str):
+            raise TypeError("plan_fingerprint must be a string")
+        normalized_plan = plan_fingerprint.strip()
+        if not normalized_plan or normalized_plan != plan_fingerprint:
+            raise ValueError("plan_fingerprint must be a non-empty trimmed string")
+
+        batches = tuple(batch_checkpoints)
+        windows = tuple(window_checkpoints)
+        if not batches:
+            raise ValueError("derived chapter checkpoint requires batch checkpoints")
+        if not windows:
+            raise ValueError("derived chapter checkpoint requires window checkpoints")
+
+        next_batch_start = 0
+        for checkpoint in batches:
+            self._validate_checkpoint(checkpoint)
+            if checkpoint.scope != "batch":
+                raise ValueError("batch_checkpoints must contain only batch scope")
+            if checkpoint.chapter != chapter:
+                raise ValueError("all batch checkpoints must match chapter")
+            if checkpoint.count <= 0 or checkpoint.start_index != next_batch_start:
+                raise ValueError(
+                    "batch checkpoints must be an exact ordered partition"
+                )
+            next_batch_start += checkpoint.count
+        chapter_count = next_batch_start
+
+        previous_window_start = -1
+        covered_until = 0
+        for checkpoint in windows:
+            self._validate_checkpoint(checkpoint)
+            if checkpoint.scope != "chapter_window":
+                raise ValueError(
+                    "window_checkpoints must contain only chapter_window scope"
+                )
+            if checkpoint.chapter != chapter:
+                raise ValueError("all window checkpoints must match chapter")
+            if checkpoint.plan_fingerprint != normalized_plan:
+                raise ValueError(
+                    "all window checkpoints must bind the active plan fingerprint"
+                )
+            if checkpoint.count <= 0 or checkpoint.start_index <= previous_window_start:
+                raise ValueError(
+                    "window checkpoints must have unique, ordered start indices"
+                )
+            window_end = checkpoint.start_index + checkpoint.count
+            if checkpoint.start_index > covered_until or window_end > chapter_count:
+                raise ValueError(
+                    "window checkpoints must cover the chapter without gaps or overflow"
+                )
+            if window_end <= covered_until:
+                raise ValueError("each ordered window checkpoint must extend coverage")
+            previous_window_start = checkpoint.start_index
+            covered_until = window_end
+        if covered_until != chapter_count:
+            raise ValueError("window checkpoints must cover the complete chapter")
+        return batches, windows, normalized_plan, chapter_count
+
+    def _build_derived_chapter_checkpoint(
+        self,
+        *,
+        chapter: int,
+        plan_fingerprint: str,
+        batch_checkpoints: tuple[GlossaryCheckpoint, ...],
+        window_checkpoints: tuple[GlossaryCheckpoint, ...],
+        chapter_count: int,
+    ) -> GlossaryCheckpoint:
+        payload = {
+            "domain": _DERIVED_CHAPTER_CHECKPOINT_DOMAIN,
+            "generation_id": self.generation_id,
+            "chapter": chapter,
+            "plan_fingerprint": plan_fingerprint,
+            "batch_count": len(batch_checkpoints),
+            "window_count": len(window_checkpoints),
+            "batches": [
+                self._checkpoint_identity(checkpoint)
+                for checkpoint in batch_checkpoints
+            ],
+            "windows": [
+                self._checkpoint_identity(checkpoint)
+                for checkpoint in window_checkpoints
+            ],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return GlossaryCheckpoint(
+            scope="chapter",
+            chapter=chapter,
+            start_index=0,
+            count=chapter_count,
+            fingerprint=hashlib.sha256(encoded).hexdigest(),
+            version=2,
+            plan_fingerprint=plan_fingerprint,
+        )
+
+    def build_derived_chapter_checkpoint(
+        self,
+        *,
+        chapter: int,
+        plan_fingerprint: str,
+        batch_checkpoints: Iterable[GlossaryCheckpoint],
+        window_checkpoints: Iterable[GlossaryCheckpoint],
+    ) -> GlossaryCheckpoint:
+        """Build a deterministic v2 parent without reading or mutating SQLite."""
+        batches, windows, plan_fingerprint, chapter_count = (
+            self._prepare_derived_chapter_inputs(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batch_checkpoints,
+                window_checkpoints=window_checkpoints,
+            )
+        )
+        return self._build_derived_chapter_checkpoint(
+            chapter=chapter,
+            plan_fingerprint=plan_fingerprint,
+            batch_checkpoints=batches,
+            window_checkpoints=windows,
+            chapter_count=chapter_count,
+        )
+
+    def _exact_child_checkpoints_match(
+        self,
+        *,
+        chapter: int,
+        plan_fingerprint: str,
+        batch_checkpoints: tuple[GlossaryCheckpoint, ...],
+        window_checkpoints: tuple[GlossaryCheckpoint, ...],
+    ) -> bool:
+        batch_rows = self.conn.execute(
+            """SELECT scope,chapter,start_index,count,fingerprint,version
+               FROM glossary_extraction_checkpoints
+               WHERE scope='batch' AND chapter=? AND generation_id=?
+               ORDER BY start_index""",
+            (chapter, self.generation_id),
+        ).fetchall()
+        actual_batches = [
+            (
+                row["scope"],
+                row["chapter"],
+                row["start_index"],
+                row["count"],
+                row["fingerprint"],
+                row["version"],
+            )
+            for row in batch_rows
+        ]
+        expected_batches = [
+            (
+                checkpoint.scope,
+                checkpoint.chapter,
+                checkpoint.start_index,
+                checkpoint.count,
+                checkpoint.fingerprint,
+                checkpoint.version,
+            )
+            for checkpoint in batch_checkpoints
+        ]
+        if actual_batches != expected_batches:
+            return False
+
+        window_rows = self.conn.execute(
+            """SELECT chapter,start_index,count,fingerprint,version,
+                      plan_fingerprint
+               FROM glossary_chapter_window_checkpoints
+               WHERE chapter=? AND generation_id=?
+               ORDER BY start_index""",
+            (chapter, self.generation_id),
+        ).fetchall()
+        actual_windows = [
+            (
+                "chapter_window",
+                row["chapter"],
+                row["start_index"],
+                row["count"],
+                row["fingerprint"],
+                row["version"],
+                row["plan_fingerprint"],
+            )
+            for row in window_rows
+        ]
+        expected_windows = [
+            (
+                checkpoint.scope,
+                checkpoint.chapter,
+                checkpoint.start_index,
+                checkpoint.count,
+                checkpoint.fingerprint,
+                checkpoint.version,
+                checkpoint.plan_fingerprint,
+            )
+            for checkpoint in window_checkpoints
+        ]
+        return actual_windows == expected_windows
+
+    def derive_chapter_checkpoint(
+        self,
+        *,
+        chapter: int,
+        plan_fingerprint: str,
+        batch_checkpoints: Iterable[GlossaryCheckpoint],
+        window_checkpoints: Iterable[GlossaryCheckpoint],
+    ) -> GlossaryCheckpoint | None:
+        """Atomically verify exact v2 children and persist their derived parent."""
+        batches, windows, plan_fingerprint, chapter_count = (
+            self._prepare_derived_chapter_inputs(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batch_checkpoints,
+                window_checkpoints=window_checkpoints,
+            )
+        )
+        self._require_no_active_transaction("derive a chapter checkpoint")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if not self._exact_child_checkpoints_match(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            ):
+                self.conn.rollback()
+                return None
+            parent = self._build_derived_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+                chapter_count=chapter_count,
+            )
+            self._write_checkpoint(parent)
+            self.conn.commit()
+            return parent
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def chapter_completion_matches_v2(
+        self,
+        *,
+        chapter: int,
+        plan_fingerprint: str,
+        batch_checkpoints: Iterable[GlossaryCheckpoint],
+        window_checkpoints: Iterable[GlossaryCheckpoint],
+    ) -> bool:
+        """Verify exact v2 children and their derived parent in one snapshot."""
+        batches, windows, plan_fingerprint, chapter_count = (
+            self._prepare_derived_chapter_inputs(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batch_checkpoints,
+                window_checkpoints=window_checkpoints,
+            )
+        )
+        self._require_no_active_transaction("verify v2 chapter completion")
+        self.conn.execute("BEGIN")
+        try:
+            if not self._exact_child_checkpoints_match(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            ):
+                return False
+            parent = self._build_derived_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+                chapter_count=chapter_count,
+            )
+            return self._checkpoint_matches(parent)
+        finally:
+            self.conn.rollback()
 
     def delete_term(self, source: str) -> bool:
         """删除一个术语条目（前端编辑用）。返回是否确有删除。"""
