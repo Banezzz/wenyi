@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 
 from trans_novel.glossary.store import (
     GlossaryCheckpoint,
@@ -29,8 +30,14 @@ class TestGlossary(unittest.TestCase):
 
     def test_insert_and_lookup(self):
         r = self.store.upsert_term(
-            GlossaryTerm(source="綾小路", target="绫小路", type=TYPE_PERSON,
-                         gender="男", aliases=["綾小路くん"], reading="あやのこうじ"),
+            GlossaryTerm(
+                source="綾小路",
+                target="绫小路",
+                type=TYPE_PERSON,
+                gender="男",
+                aliases=["綾小路くん"],
+                reading="あやのこうじ",
+            ),
             chapter=0,
         )
         self.assertEqual(r, "inserted")
@@ -184,9 +191,7 @@ class TestGlossary(unittest.TestCase):
         invalid = GlossaryTerm(source="invalid", target="无效", note=["bad"])
 
         with self.assertRaisesRegex(TypeError, "note"):
-            self.store.upsert_terms(
-                [valid, invalid], chapter=2, checkpoint=checkpoint
-            )
+            self.store.upsert_terms([valid, invalid], chapter=2, checkpoint=checkpoint)
         self.assertIsNone(self.store.get_term("valid"))
         self.assertFalse(self.store.checkpoint_matches(checkpoint))
 
@@ -218,6 +223,413 @@ class TestGlossary(unittest.TestCase):
         self.store = GlossaryStore(db_path)
         self.assertEqual(self.store.generation_id, generation_id)
         self.assertTrue(self.store.checkpoint_matches(replacement))
+
+    def test_opening_legacy_database_adds_window_table_without_data_loss(self):
+        checkpoint = GlossaryCheckpoint("batch", 3, 0, 1, "legacy-batch")
+        self.store.upsert_terms(
+            [GlossaryTerm(source="legacy", target="旧译")],
+            chapter=3,
+            checkpoint=checkpoint,
+        )
+        generation_id = self.store.generation_id
+        db_path = self.store.db_path
+        self.store.conn.execute(
+            "DROP TABLE IF EXISTS glossary_chapter_window_checkpoints"
+        )
+        self.store.conn.commit()
+        self.store.close()
+
+        self.store = GlossaryStore(
+            db_path,
+            expected_generation_id=generation_id,
+        )
+
+        self.assertEqual(self.store.generation_id, generation_id)
+        self.assertEqual(self.store.get_term("legacy").target, "旧译")
+        self.assertTrue(self.store.checkpoint_matches(checkpoint))
+        table = self.store.conn.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type='table' AND name='glossary_chapter_window_checkpoints'"""
+        ).fetchone()
+        self.assertIsNotNone(table)
+
+        window = GlossaryCheckpoint(
+            "chapter_window",
+            3,
+            0,
+            1,
+            "window-fingerprint",
+            plan_fingerprint="plan-v1",
+        )
+        self.store.record_checkpoint(window)
+        self.assertTrue(self.store.checkpoint_matches(window))
+
+    def test_empty_window_result_still_records_checkpoint(self):
+        checkpoint = GlossaryCheckpoint(
+            "chapter_window",
+            4,
+            0,
+            2,
+            "empty-window",
+            plan_fingerprint="plan-v1",
+        )
+
+        summary = self.store.upsert_terms(
+            [],
+            chapter=4,
+            checkpoint=checkpoint,
+        )
+
+        self.assertEqual(
+            summary,
+            {"inserted": 0, "updated": 0, "conflict": 0, "unchanged": 0},
+        )
+        self.assertTrue(self.store.checkpoint_matches(checkpoint))
+
+    def test_window_upsert_rolls_back_terms_conflicts_and_checkpoint(self):
+        self.store.upsert_term(
+            GlossaryTerm(source="locked", target="canonical", confidence="high"),
+            chapter=0,
+        )
+        self.store.lock_term("locked")
+        checkpoint = GlossaryCheckpoint(
+            "chapter_window",
+            4,
+            0,
+            2,
+            "rollback-window",
+            plan_fingerprint="plan-v1",
+        )
+        self.store.conn.execute(
+            """CREATE TRIGGER fail_window_checkpoint BEFORE INSERT
+               ON glossary_chapter_window_checkpoints
+               BEGIN SELECT RAISE(ABORT, 'window checkpoint failure'); END"""
+        )
+        self.store.conn.commit()
+
+        with self.assertRaisesRegex(Exception, "window checkpoint failure"):
+            self.store.upsert_terms(
+                [
+                    GlossaryTerm(source="locked", target="proposal"),
+                    GlossaryTerm(source="new", target="新译"),
+                ],
+                chapter=4,
+                checkpoint=checkpoint,
+            )
+
+        locked = self.store.get_term("locked")
+        assert locked is not None
+        self.assertEqual(locked.target, "canonical")
+        self.assertEqual(locked.status, "ok")
+        self.assertEqual(self.store.open_conflicts(), [])
+        self.assertIsNone(self.store.get_term("new"))
+        self.assertFalse(self.store.checkpoint_matches(checkpoint))
+
+    @staticmethod
+    def _v2_checkpoint_set():
+        chapter = 7
+        plan_fingerprint = "chapter-window-plan-v1"
+        batches = [
+            GlossaryCheckpoint("batch", chapter, 0, 2, "batch-a"),
+            GlossaryCheckpoint("batch", chapter, 2, 2, "batch-b"),
+        ]
+        windows = [
+            GlossaryCheckpoint(
+                "chapter_window",
+                chapter,
+                0,
+                3,
+                "window-a",
+                plan_fingerprint=plan_fingerprint,
+            ),
+            GlossaryCheckpoint(
+                "chapter_window",
+                chapter,
+                1,
+                3,
+                "window-b",
+                plan_fingerprint=plan_fingerprint,
+            ),
+        ]
+        return chapter, plan_fingerprint, batches, windows
+
+    def test_derive_chapter_checkpoint_requires_every_child(self):
+        chapter, plan_fingerprint, batches, windows = self._v2_checkpoint_set()
+        for checkpoint in [*batches, windows[0]]:
+            self.store.record_checkpoint(checkpoint)
+
+        expected_parent = self.store.build_derived_chapter_checkpoint(
+            chapter=chapter,
+            plan_fingerprint=plan_fingerprint,
+            batch_checkpoints=batches,
+            window_checkpoints=windows,
+        )
+        self.assertEqual(expected_parent.scope, "chapter")
+        self.assertEqual(expected_parent.start_index, 0)
+        self.assertEqual(expected_parent.count, 4)
+        self.assertEqual(expected_parent.version, 2)
+        self.assertEqual(expected_parent.plan_fingerprint, plan_fingerprint)
+
+        self.assertIsNone(
+            self.store.derive_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+        self.assertFalse(self.store.checkpoint_matches(expected_parent))
+
+        self.store.record_checkpoint(windows[1])
+        derived = self.store.derive_chapter_checkpoint(
+            chapter=chapter,
+            plan_fingerprint=plan_fingerprint,
+            batch_checkpoints=batches,
+            window_checkpoints=windows,
+        )
+        self.assertEqual(derived, expected_parent)
+        self.assertTrue(
+            self.store.chapter_completion_matches_v2(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+
+    def test_derived_checkpoint_rejects_malformed_or_extra_children(self):
+        chapter, plan_fingerprint, batches, windows = self._v2_checkpoint_set()
+        malformed = [
+            ("reordered-batches", list(reversed(batches)), windows),
+            ("reordered-windows", batches, list(reversed(windows))),
+            ("duplicate-window", batches, [windows[0], windows[0], windows[1]]),
+            (
+                "wrong-plan",
+                batches,
+                [
+                    replace(windows[0], plan_fingerprint="another-plan"),
+                    windows[1],
+                ],
+            ),
+        ]
+        for label, candidate_batches, candidate_windows in malformed:
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    self.store.build_derived_chapter_checkpoint(
+                        chapter=chapter,
+                        plan_fingerprint=plan_fingerprint,
+                        batch_checkpoints=candidate_batches,
+                        window_checkpoints=candidate_windows,
+                    )
+
+        for checkpoint in [*batches, *windows]:
+            self.store.record_checkpoint(checkpoint)
+        extra = GlossaryCheckpoint("batch", chapter, 4, 1, "unexpected-batch")
+        self.store.record_checkpoint(extra)
+        self.assertIsNone(
+            self.store.derive_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+        self.assertFalse(
+            self.store.chapter_completion_matches_v2(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+
+        self.store.conn.execute(
+            """DELETE FROM glossary_extraction_checkpoints
+               WHERE scope='batch' AND chapter=? AND start_index=?""",
+            (chapter, extra.start_index),
+        )
+        self.store.conn.commit()
+
+        extra_window = GlossaryCheckpoint(
+            "chapter_window",
+            chapter,
+            2,
+            2,
+            "unexpected-window",
+            plan_fingerprint=plan_fingerprint,
+        )
+        self.store.record_checkpoint(extra_window)
+        self.assertIsNone(
+            self.store.derive_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+        self.store.conn.execute(
+            """DELETE FROM glossary_chapter_window_checkpoints
+               WHERE chapter=? AND start_index=?""",
+            (chapter, extra_window.start_index),
+        )
+        self.store.conn.commit()
+
+        stale_plan_window = replace(
+            extra_window,
+            fingerprint="stale-plan-window",
+            plan_fingerprint="stale-plan",
+        )
+        self.store.record_checkpoint(stale_plan_window)
+        self.assertIsNone(
+            self.store.derive_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+        self.assertFalse(
+            self.store.chapter_completion_matches_v2(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+        self.store.conn.execute(
+            """DELETE FROM glossary_chapter_window_checkpoints
+               WHERE chapter=? AND start_index=?""",
+            (chapter, stale_plan_window.start_index),
+        )
+        self.store.conn.commit()
+        self.assertIsNotNone(
+            self.store.derive_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+
+    def test_derive_chapter_checkpoint_rejects_stale_child_generation(self):
+        chapter, plan_fingerprint, batches, windows = self._v2_checkpoint_set()
+        for checkpoint in [*batches, *windows]:
+            self.store.record_checkpoint(checkpoint)
+        self.store.conn.execute(
+            """UPDATE glossary_chapter_window_checkpoints
+               SET generation_id='stale-generation'
+               WHERE chapter=? AND start_index=?""",
+            (chapter, windows[0].start_index),
+        )
+        self.store.conn.commit()
+
+        self.assertIsNone(
+            self.store.derive_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+        expected_parent = self.store.build_derived_chapter_checkpoint(
+            chapter=chapter,
+            plan_fingerprint=plan_fingerprint,
+            batch_checkpoints=batches,
+            window_checkpoints=windows,
+        )
+        self.assertFalse(self.store.checkpoint_matches(expected_parent))
+
+    def test_derived_checkpoint_operations_reject_nested_transactions(self):
+        chapter, plan_fingerprint, batches, windows = self._v2_checkpoint_set()
+        for checkpoint in [*batches, *windows]:
+            self.store.record_checkpoint(checkpoint)
+
+        self.store.conn.execute("BEGIN")
+        with self.assertRaisesRegex(RuntimeError, "active transaction"):
+            self.store.derive_chapter_checkpoint(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        self.assertTrue(self.store.conn.in_transaction)
+        with self.assertRaisesRegex(RuntimeError, "active transaction"):
+            self.store.chapter_completion_matches_v2(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        self.assertTrue(self.store.conn.in_transaction)
+        self.store.conn.rollback()
+
+        parent = self.store.build_derived_chapter_checkpoint(
+            chapter=chapter,
+            plan_fingerprint=plan_fingerprint,
+            batch_checkpoints=batches,
+            window_checkpoints=windows,
+        )
+        self.assertFalse(self.store.checkpoint_matches(parent))
+
+    def test_v2_completion_rechecks_children_when_parent_remains(self):
+        chapter, plan_fingerprint, batches, windows = self._v2_checkpoint_set()
+        for checkpoint in [*batches, *windows]:
+            self.store.record_checkpoint(checkpoint)
+        parent = self.store.derive_chapter_checkpoint(
+            chapter=chapter,
+            plan_fingerprint=plan_fingerprint,
+            batch_checkpoints=batches,
+            window_checkpoints=windows,
+        )
+        assert parent is not None
+        self.assertTrue(self.store.checkpoint_matches(parent))
+
+        self.store.conn.execute(
+            """DELETE FROM glossary_chapter_window_checkpoints
+               WHERE chapter=? AND start_index=?""",
+            (chapter, windows[0].start_index),
+        )
+        self.store.conn.commit()
+        self.assertTrue(self.store.checkpoint_matches(parent))
+        self.assertFalse(
+            self.store.chapter_completion_matches_v2(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+
+        self.store.record_checkpoint(windows[0])
+        self.assertTrue(
+            self.store.chapter_completion_matches_v2(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            )
+        )
+
+        changed_windows = [
+            replace(windows[0], fingerprint="window-a-after-target-change"),
+            windows[1],
+        ]
+        changed_parent = self.store.build_derived_chapter_checkpoint(
+            chapter=chapter,
+            plan_fingerprint=plan_fingerprint,
+            batch_checkpoints=batches,
+            window_checkpoints=changed_windows,
+        )
+        self.assertNotEqual(changed_parent.fingerprint, parent.fingerprint)
+        self.assertTrue(self.store.checkpoint_matches(parent))
+        self.assertFalse(
+            self.store.chapter_completion_matches_v2(
+                chapter=chapter,
+                plan_fingerprint=plan_fingerprint,
+                batch_checkpoints=batches,
+                window_checkpoints=changed_windows,
+            )
+        )
 
     def test_existing_store_open_fails_closed_on_missing_or_wrong_generation(self):
         db_path = self.store.db_path

@@ -10,15 +10,18 @@ import unittest
 from trans_novel.config import Config
 from trans_novel.llm.base import FakeClient
 from trans_novel.glossary.store import (
+    GlossaryCheckpoint,
     GlossaryStore,
     GlossaryTerm,
     TYPE_APPELLATION,
 )
+from trans_novel.glossary import extractor as extractor_module
 from trans_novel.glossary.extractor import (
     GlossaryExtractionError,
     GlossaryExtractor,
 )
 from trans_novel.agents.analyzer import Analyzer
+from trans_novel.agents import prompts
 from trans_novel.pipeline.context import RollingContext
 
 
@@ -190,25 +193,266 @@ class TestExtractor(unittest.TestCase):
 
     def test_strict_response_envelope_distinguishes_empty_success(self):
         invalid = [
-            ("top-level-list", []),
-            ("missing-key", {}),
-            ("terms-object", {"terms": {}}),
-            ("terms-null", {"terms": None}),
+            ("top-level-list", [], "response_not_object"),
+            ("missing-key", {}, "terms_missing"),
+            (
+                "extra-key",
+                {"terms": [], "extra": True},
+                "response_extra_keys",
+            ),
+            ("terms-object", {"terms": {}}, "terms_not_list"),
+            ("terms-null", {"terms": None}, "terms_not_list"),
         ]
-        for label, payload in invalid:
+        for label, payload, expected_kind in invalid:
             with self.subTest(case=label):
                 ext = GlossaryExtractor(
                     FakeClient(handler=lambda m, t, j, p=payload: json.dumps(p)),
                     _cfg(),
                 )
-                with self.assertRaises(GlossaryExtractionError):
+                with self.assertRaises(GlossaryExtractionError) as raised:
                     ext.extract("source", "target", [])
+                self.assertEqual(raised.exception.kind, expected_kind)
 
         ext = GlossaryExtractor(
             FakeClient(handler=lambda m, t, j: json.dumps({"terms": []})),
             _cfg(),
         )
         self.assertEqual(ext.extract("source", "target", []), [])
+
+    def test_base_prompt_overflow_does_not_call_model_or_checkpoint(self):
+        self.assertEqual(
+            extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
+            30_000,
+        )
+        client = FakeClient(
+            handler=lambda m, t, j: self.fail("oversized base prompt reached model")
+        )
+        extractor = GlossaryExtractor(client, _cfg())
+        checkpoint = GlossaryCheckpoint(
+            "chapter_window",
+            5,
+            0,
+            1,
+            "oversized-window",
+            plan_fingerprint="plan-v1",
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            store = GlossaryStore(os.path.join(d, "g.db"))
+            with self.assertRaises(GlossaryExtractionError) as raised:
+                extractor.extract_and_store(
+                    store,
+                    "oversized-source " * 2_500,
+                    "超长译文",
+                    chapter=5,
+                    checkpoint=checkpoint,
+                )
+
+            self.assertEqual(raised.exception.kind, "prompt_too_large")
+            self.assertEqual(client.calls, [])
+            self.assertFalse(store.checkpoint_matches(checkpoint))
+            self.assertEqual(store.stats()["terms"], 0)
+            store.close()
+
+    def test_refusal_with_embedded_empty_json_does_not_checkpoint(self):
+        client = FakeClient(
+            handler=lambda m, t, j: (
+                "抱歉，我不能处理这些内容。\n{\"terms\":[]}\n以上。"
+            )
+        )
+        extractor = GlossaryExtractor(client, _cfg())
+        checkpoint = GlossaryCheckpoint(
+            "chapter_window",
+            5,
+            0,
+            1,
+            "refusal-window",
+            plan_fingerprint="plan-v1",
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            store = GlossaryStore(os.path.join(d, "g.db"))
+            with self.assertRaises(GlossaryExtractionError) as raised:
+                extractor.extract_and_store(
+                    store,
+                    "source",
+                    "target",
+                    chapter=5,
+                    checkpoint=checkpoint,
+                )
+            self.assertEqual(raised.exception.kind, "model_or_json_error")
+            self.assertFalse(store.checkpoint_matches(checkpoint))
+            store.close()
+
+    def test_nonstandard_or_duplicate_json_does_not_checkpoint(self):
+        invalid = (
+            '{"terms":[NaN]}',
+            '{"terms":[],"terms":[]}',
+            '{"terms":[{"source":"a","source":"b","target":"x"}]}',
+        )
+        for index, raw in enumerate(invalid):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as d:
+                client = FakeClient(handler=lambda m, t, j, value=raw: value)
+                extractor = GlossaryExtractor(client, _cfg())
+                checkpoint = GlossaryCheckpoint(
+                    "chapter_window",
+                    6,
+                    index,
+                    1,
+                    f"invalid-json-{index}",
+                    plan_fingerprint="plan-v1",
+                )
+                store = GlossaryStore(os.path.join(d, "g.db"))
+                with self.assertRaises(GlossaryExtractionError) as raised:
+                    extractor.extract_and_store(
+                        store,
+                        "source",
+                        "target",
+                        chapter=6,
+                        checkpoint=checkpoint,
+                    )
+                self.assertEqual(raised.exception.kind, "model_or_json_error")
+                self.assertFalse(store.checkpoint_matches(checkpoint))
+                store.close()
+
+    def test_rejected_candidates_do_not_write_terms_or_checkpoint(self):
+        payload = {
+            "terms": [
+                {"source": "valid", "target": "有效"},
+                42,
+                {"source": "", "target": "invalid"},
+            ]
+        }
+        extractor = GlossaryExtractor(
+            FakeClient(handler=lambda m, t, j: json.dumps(payload)),
+            _cfg(),
+        )
+        checkpoint = GlossaryCheckpoint(
+            "chapter_window",
+            7,
+            0,
+            1,
+            "partially-malformed",
+            plan_fingerprint="plan-v1",
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            store = GlossaryStore(os.path.join(d, "g.db"))
+            with self.assertRaises(GlossaryExtractionError) as raised:
+                extractor.extract_and_store(
+                    store,
+                    "source",
+                    "target",
+                    chapter=7,
+                    checkpoint=checkpoint,
+                )
+
+            self.assertEqual(raised.exception.kind, "terms_rejected")
+            self.assertEqual(store.stats()["terms"], 0)
+            self.assertFalse(store.checkpoint_matches(checkpoint))
+            store.close()
+
+    def test_reference_truncation_is_stable_and_keeps_whole_terms(self):
+        self.assertEqual(
+            extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
+            30_000,
+        )
+        sources = [f"term-{index:03d}" for index in range(240)]
+        existing = [
+            GlossaryTerm(
+                source=source,
+                target=f"译名-{index:03d}-" + "译" * 160,
+            )
+            for index, source in enumerate(sources)
+        ]
+        source_text = " ".join(sources)
+        target_text = " ".join(f"译名-{index:03d}" for index in range(len(sources)))
+        client = FakeClient(
+            handler=lambda m, t, j: json.dumps({"terms": []}, ensure_ascii=False)
+        )
+        extractor = GlossaryExtractor(client, _cfg())
+        checkpoint = GlossaryCheckpoint(
+            "chapter_window",
+            6,
+            0,
+            1,
+            "bounded-window",
+            plan_fingerprint="plan-v1",
+        )
+
+        system = prompts.render("glossary_extractor_system", src="ja", tgt="zh")
+        unbounded_user = prompts.render(
+            "glossary_extractor_user",
+            src="ja",
+            tgt="zh",
+            glossary=prompts.render_glossary(existing),
+            source=source_text,
+            target=target_text,
+        )
+        unbounded_messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": unbounded_user},
+        ]
+        self.assertGreater(
+            len(
+                json.dumps(
+                    unbounded_messages,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ),
+            extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            store = GlossaryStore(os.path.join(d, "g.db"))
+            store.upsert_terms(existing, chapter=0, checkpoint=None)
+            first = extractor.extract_and_store(
+                store,
+                source_text,
+                target_text,
+                chapter=6,
+                checkpoint=checkpoint,
+            )
+            second = extractor.extract_and_store(
+                store,
+                source_text,
+                target_text,
+                chapter=6,
+                checkpoint=checkpoint,
+            )
+
+            self.assertEqual(client.calls[0]["messages"], client.calls[1]["messages"])
+            messages = client.calls[0]["messages"]
+            serialized = json.dumps(
+                messages,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            self.assertLessEqual(
+                len(serialized),
+                extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
+            )
+            user = messages[-1]["content"]
+            self.assertIn(source_text, user)
+            self.assertIn(target_text, user)
+
+            glossary_block = user.split("【已有对照表（参考，尽量沿用其译法）】\n", 1)[
+                1
+            ].split("\n\n【原文", 1)[0]
+            selected_lines = [line for line in glossary_block.splitlines() if line]
+            all_lines = set(prompts.render_glossary(existing).splitlines())
+            self.assertGreater(len(selected_lines), 0)
+            self.assertLess(len(selected_lines), len(existing))
+            self.assertTrue(all(line in all_lines for line in selected_lines))
+            self.assertGreater(first["reference_terms_dropped"], 0)
+            self.assertEqual(
+                first["prompt_chars"],
+                len(serialized),
+            )
+            self.assertEqual(first["reference_chars"], second["reference_chars"])
+            self.assertTrue(store.checkpoint_matches(checkpoint))
+            store.close()
 
     def test_store_extraction_prompt_uses_only_source_relevant_terms(self):
         cfg = _cfg()
