@@ -215,6 +215,8 @@ class GlossaryExtractor(Agent):
             existing,
             reference_total=len(all_terms),
         )
+        if parsed.stats["rejected"]:
+            raise GlossaryExtractionError("terms_rejected")
         summary = {**empty_counts, **parsed.stats}
         try:
             counts = store.upsert_terms(
