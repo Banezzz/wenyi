@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +33,34 @@ class _ParsedTerms:
     stats: dict[str, int]
 
 
+GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS = 30_000
+
+
+def _serialized_prompt_chars(system: str, user: str) -> int:
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    return len(json.dumps(
+        messages,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ))
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _was_normalized(raw: dict[str, Any], term: GlossaryTerm) -> bool:
     """只统计响应中实际出现且被改写的字段，不把缺省字段算作归一化。"""
     for name in ("source", "target", "reading", "type", "gender", "aliases", "note"):
@@ -41,6 +70,59 @@ def _was_normalized(raw: dict[str, Any], term: GlossaryTerm) -> bool:
 
 
 class GlossaryExtractor(Agent):
+    def _ask_strict_json(self, system: str, user: str) -> Any:
+        text = self.client.complete(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            tier="fast",
+            json_mode=True,
+        )
+        return json.loads(
+            (text or "").strip(),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+
+    def _render_bounded_prompt(
+        self,
+        source_text: str,
+        target_text: str,
+        existing: list[GlossaryTerm],
+    ) -> tuple[str, str, list[GlossaryTerm], int, int]:
+        """Render the exact request, dropping only whole reference entries."""
+        system = prompts.render("glossary_extractor_system", src=self.src, tgt=self.tgt)
+
+        def render(selected: list[GlossaryTerm]) -> tuple[str, str, int]:
+            rendered = prompts.render_glossary(selected)
+            user = prompts.render(
+                "glossary_extractor_user",
+                src=self.src,
+                tgt=self.tgt,
+                glossary=rendered,
+                source=source_text,
+                target=target_text,
+            )
+            return rendered, user, _serialized_prompt_chars(system, user)
+
+        rendered_glossary, user, prompt_chars = render([])
+        if prompt_chars > GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS:
+            raise GlossaryExtractionError("prompt_too_large")
+
+        selected: list[GlossaryTerm] = []
+        for term in existing:
+            candidate = [*selected, term]
+            candidate_glossary, candidate_user, candidate_chars = render(candidate)
+            if candidate_chars > GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS:
+                continue
+            selected = candidate
+            rendered_glossary = candidate_glossary
+            user = candidate_user
+            prompt_chars = candidate_chars
+
+        return system, user, selected, len(rendered_glossary), prompt_chars
+
     def _extract_with_stats(
         self,
         source_text: str,
@@ -49,18 +131,11 @@ class GlossaryExtractor(Agent):
         *,
         reference_total: int | None = None,
     ) -> _ParsedTerms:
-        system = prompts.render("glossary_extractor_system", src=self.src, tgt=self.tgt)
-        rendered_glossary = prompts.render_glossary(existing)
-        user = prompts.render(
-            "glossary_extractor_user",
-            src=self.src,
-            tgt=self.tgt,
-            glossary=rendered_glossary,
-            source=source_text,
-            target=target_text,
+        system, user, selected, reference_chars, prompt_chars = (
+            self._render_bounded_prompt(source_text, target_text, existing)
         )
         try:
-            data = self._ask_json(system, user, tier="fast")
+            data = self._ask_strict_json(system, user)
         except Exception as exc:
             raise GlossaryExtractionError("model_or_json_error") from exc
 
@@ -68,6 +143,8 @@ class GlossaryExtractor(Agent):
             raise GlossaryExtractionError("response_not_object")
         if "terms" not in data:
             raise GlossaryExtractionError("terms_missing")
+        if set(data) != {"terms"}:
+            raise GlossaryExtractionError("response_extra_keys")
         raw = data["terms"]
         if not isinstance(raw, list):
             raise GlossaryExtractionError("terms_not_list")
@@ -93,8 +170,11 @@ class GlossaryExtractor(Agent):
                 "reference_terms_total": (
                     len(existing) if reference_total is None else reference_total
                 ),
-                "reference_terms_selected": len(existing),
-                "reference_chars": len(rendered_glossary),
+                "reference_terms_relevant": len(existing),
+                "reference_terms_selected": len(selected),
+                "reference_terms_dropped": len(existing) - len(selected),
+                "reference_chars": reference_chars,
+                "prompt_chars": prompt_chars,
             },
         )
 
