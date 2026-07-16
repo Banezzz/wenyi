@@ -13,7 +13,7 @@ from trans_novel.llm.base import FakeClient
 from trans_novel.pipeline.orchestrator import Orchestrator
 from trans_novel.assemble.writer import assemble
 from trans_novel.assemble.report import build_report
-from trans_novel.glossary.store import GlossaryStore
+from trans_novel.glossary.store import GlossaryStore, GlossaryTerm
 from trans_novel.ingest.segmenter import load_document
 from tests.sample_data import write_sample_txt, write_sample_epub
 from tests.fake_llm import routing_handler
@@ -56,6 +56,57 @@ def _write_vertical_epub(path: str) -> None:
         zf.writestr("OEBPS/content.opf", opf)
         zf.writestr("OEBPS/style.css", "html { writing-mode: vertical-rl; }")
         zf.writestr("OEBPS/ch1.xhtml", ch1)
+
+
+def _write_nested_ncx_epub(path: str) -> None:
+    container = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+    opf = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Source Book</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx"><itemref idref="ch1"/></spine>
+  <guide>
+    <reference type="text" title="Chapter One" href="text/ch1.xhtml#top"/>
+    <reference type="text" title="Nested Detail" href="text/ch1.xhtml#detail"/>
+  </guide>
+</package>
+"""
+    ncx = """<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" xml:lang="en">
+  <docTitle><text>Source Book</text></docTitle>
+  <navMap>
+    <navPoint id="parent"><navLabel><text>Chapter One</text></navLabel>
+      <content src="text/ch1.xhtml#top"/>
+      <navPoint id="child"><navLabel><text>Nested Detail</text></navLabel>
+        <content src="text/ch1.xhtml#detail"/>
+      </navPoint>
+    </navPoint>
+  </navMap>
+</ncx>
+"""
+    chapter = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Source Book</title></head>
+<body><h1 id="top">Chapter One</h1><h2 id="detail">Nested Detail</h2>
+<p>Body text for translation.</p></body></html>
+"""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+        zf.writestr("META-INF/container.xml", container)
+        zf.writestr("OEBPS/content.opf", opf)
+        zf.writestr("OEBPS/toc.ncx", ncx)
+        zf.writestr("OEBPS/text/ch1.xhtml", chapter)
 
 
 def _config(state_dir: str):
@@ -109,6 +160,7 @@ class TestAssembleEpub(unittest.TestCase):
             ep = os.path.join(d, "novel.epub")
             write_sample_epub(ep)
             store, _ = _run(ep, os.path.join(d, "state"))
+            translated_title = store.load_manifest()["chapters"][0]["title_translated"]
             out = assemble(store, ep, out_format="epub")
             self.assertTrue(zipfile.is_zipfile(out))
             with zipfile.ZipFile(out) as z:
@@ -116,6 +168,7 @@ class TestAssembleEpub(unittest.TestCase):
             self.assertIn("润0", html)            # 译文已替换
             self.assertNotIn("data-tn-id", html)  # 占位标记已清除
             self.assertNotIn("綾小路は教室", html)  # 原文已被替换
+            self.assertIn(f"<title>{translated_title}</title>", html)
 
     def test_vertical_epub_is_exported_as_horizontal_chinese(self):
         with tempfile.TemporaryDirectory() as d:
@@ -167,6 +220,34 @@ class TestTitleTranslation(unittest.TestCase):
             self.assertNotIn("title_translated", m2)                    # 书名译名字段被清理
             self.assertEqual(m2["chapters"][0]["title_translated"], "佳穗登场")  # 仅标题替换可直接保留
 
+    def test_title_prompt_uses_only_source_relevant_glossary_terms(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            prepared = Orchestrator(
+                cfg, client=FakeClient(handler=routing_handler)
+            ).prepare(txt)
+            glossary = prepared.open_glossary()
+            glossary.upsert_term(GlossaryTerm(source="第一章", target="第1章"))
+            glossary.upsert_term(
+                GlossaryTerm(source="UnrelatedTerm", target="无关术语")
+            )
+            glossary.close()
+
+            title_prompts: list[str] = []
+
+            def handler(messages, tier, json_mode):
+                if "标题翻译专家" in messages[0]["content"]:
+                    title_prompts.append(messages[-1]["content"])
+                return routing_handler(messages, tier, json_mode)
+
+            Orchestrator(cfg, client=FakeClient(handler=handler)).run(txt)
+
+            self.assertEqual(len(title_prompts), 1)
+            self.assertIn("第一章 → 第1章", title_prompts[0])
+            self.assertNotIn("UnrelatedTerm", title_prompts[0])
+
     def test_rewrite_nav_and_ncx_labels(self):
         from trans_novel.assemble.writer import _rewrite_toc
 
@@ -174,16 +255,80 @@ class TestTitleTranslation(unittest.TestCase):
                b'<nav epub:type="toc"><ol>'
                b'<li><a href="ch1.xhtml">\xe7\xac\xac\xe4\xb8\x80\xe7\xab\xa0</a></li>'
                b'</ol></nav></body></html>')
-        out = _rewrite_toc(nav, {"ch1.xhtml": "第一章译名"}, is_ncx=False)
+        out = _rewrite_toc(
+            nav,
+            {("ch1.xhtml", "第一章"): "第一章译名"},
+            is_ncx=False,
+        )
         self.assertIn("第一章译名", out.decode("utf-8"))
 
         ncx = (b'<?xml version="1.0"?><ncx><navMap><navPoint>'
                b'<navLabel><text>old</text></navLabel>'
                b'<content src="text/ch1.xhtml#x"/></navPoint></navMap></ncx>')
-        out2 = _rewrite_toc(ncx, {"ch1.xhtml": "第一章译名"}, is_ncx=True)
+        out2 = _rewrite_toc(
+            ncx,
+            {("text/ch1.xhtml", "old"): "第一章译名"},
+            is_ncx=True,
+        )
         dec = out2.decode("utf-8")
         self.assertIn("第一章译名", dec)
         self.assertNotIn(">old<", dec)
+
+    def test_ncx_rewrite_preserves_nested_labels_and_full_paths(self):
+        from trans_novel.assemble.writer import _rewrite_toc
+
+        ncx = b"""<?xml version="1.0"?><ncx xml:lang="en"><navMap>
+          <navPoint id="main"><navLabel><text>Chapter One</text></navLabel>
+            <content src="text/ch1.xhtml#top"/>
+            <navPoint id="child"><navLabel><text>Nested Detail</text></navLabel>
+              <content src="text/ch1.xhtml#detail"/>
+            </navPoint>
+          </navPoint>
+          <navPoint id="appendix"><navLabel><text>Appendix One</text></navLabel>
+            <content src="appendix/ch1.xhtml"/>
+          </navPoint>
+        </navMap></ncx>"""
+        rules = {
+            ("OEBPS/text/ch1.xhtml", "Chapter One"): "第一章",
+            ("OEBPS/appendix/ch1.xhtml", "Appendix One"): "附录一",
+        }
+
+        rewritten = _rewrite_toc(
+            ncx,
+            rules,
+            is_ncx=True,
+            toc_path="OEBPS/toc.ncx",
+            lang="zh-Hans",
+        ).decode("utf-8")
+
+        self.assertIn("第一章", rewritten)
+        self.assertIn("附录一", rewritten)
+        self.assertIn("Nested Detail", rewritten)
+        self.assertEqual(rewritten.count("<navPoint"), 3)
+        self.assertIn('src="text/ch1.xhtml#detail"', rewritten)
+        self.assertIn('xml:lang="zh-Hans"', rewritten)
+
+    def test_epub2_assembly_localizes_parent_without_flattening_ncx(self):
+        with tempfile.TemporaryDirectory() as d:
+            ep = os.path.join(d, "nested.epub")
+            _write_nested_ncx_epub(ep)
+            store, _ = _run(ep, os.path.join(d, "state"))
+            translated_title = store.load_manifest()["chapters"][0]["title_translated"]
+
+            out = assemble(store, ep, out_format="epub")
+
+            with zipfile.ZipFile(out) as zf:
+                ncx = zf.read("OEBPS/toc.ncx").decode("utf-8")
+                opf = zf.read("OEBPS/content.opf").decode("utf-8")
+                html = zf.read("OEBPS/text/ch1.xhtml").decode("utf-8")
+            self.assertIn(f"<text>{translated_title}</text>", ncx)
+            self.assertIn("<text>Nested Detail</text>", ncx)
+            self.assertEqual(ncx.count("<navPoint"), 2)
+            self.assertIn('xml:lang="zh-Hans"', ncx)
+            self.assertIn("<dc:title>Source Book</dc:title>", opf)
+            self.assertIn(f'title="{translated_title}"', opf)
+            self.assertIn('title="Nested Detail"', opf)
+            self.assertIn(f"<title>{translated_title}</title>", html)
 
     def test_non_string_title_items_fall_back_to_source_titles(self):
         with tempfile.TemporaryDirectory() as d:

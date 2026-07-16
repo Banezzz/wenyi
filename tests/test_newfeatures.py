@@ -198,7 +198,21 @@ class TestGlossaryAudit(unittest.TestCase):
                 for call in resume_client.calls
             ))
             g = store.open_glossary()
-            self.assertTrue(g.checkpoint_matches(final_checkpoint))
+            completed = store.load_chapter(0)
+            batch_plan = completed.meta["glossary_plan"]
+            chapter_plan = completed.meta["chapter_glossary_plan"]
+            batches = Orchestrator._batch_glossary_checkpoints(
+                0, completed.text_segments, batch_plan["units"]
+            )
+            windows = Orchestrator._chapter_glossary_window_checkpoints(
+                0, completed.text_segments, chapter_plan
+            )
+            self.assertTrue(g.chapter_completion_matches_v2(
+                chapter=0,
+                plan_fingerprint=chapter_plan["fingerprint"],
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            ))
             g.close()
             self.assertEqual(
                 store.load_manifest()["chapters"][0]["glossary_status"],

@@ -760,13 +760,19 @@ class TestReviewReporting(unittest.TestCase):
                     count=len(segments),
                     fingerprint=translation_fingerprint(segments),
                 )))
-            self.assertTrue(glossary.checkpoint_matches(GlossaryCheckpoint(
-                scope="chapter",
+            chapter_plan = ch.meta["chapter_glossary_plan"]
+            batches = Orchestrator._batch_glossary_checkpoints(
+                0, ch.text_segments, plan["units"]
+            )
+            windows = Orchestrator._chapter_glossary_window_checkpoints(
+                0, ch.text_segments, chapter_plan
+            )
+            self.assertTrue(glossary.chapter_completion_matches_v2(
                 chapter=0,
-                start_index=0,
-                count=len(ch.text_segments),
-                fingerprint=translation_fingerprint(ch.text_segments),
-            )))
+                plan_fingerprint=chapter_plan["fingerprint"],
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            ))
             glossary.close()
             with open(store.event_log_path, encoding="utf-8") as f:
                 events = [json.loads(line) for line in f if line.strip()]
@@ -779,6 +785,99 @@ class TestReviewReporting(unittest.TestCase):
             self.assertEqual(
                 context,
                 Orchestrator._context_before_chapter(store, 2).to_dict(),
+            )
+
+    def test_post_review_success_clears_pre_review_glossary_failure(self):
+        """Successful post-review reconciliation is authoritative in one run."""
+        from trans_novel.glossary.extractor import GlossaryExtractionError
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "novel.txt")
+            write_sample_txt(txt)
+            cfg = _config(os.path.join(d, "state"))
+            cfg.pipeline.autofix_severe = True
+            orchestrator = Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler(self.FIX_TEXT)),
+            )
+            original = orchestrator.extractor.extract_and_store
+            failed = False
+
+            def fail_first_window(
+                glossary,
+                source_text,
+                target_text,
+                chapter,
+                *,
+                checkpoint=None,
+            ):
+                nonlocal failed
+                if (
+                    checkpoint is not None
+                    and checkpoint.scope == "chapter_window"
+                    and not failed
+                ):
+                    failed = True
+                    raise GlossaryExtractionError("terms_missing")
+                return original(
+                    glossary,
+                    source_text,
+                    target_text,
+                    chapter,
+                    checkpoint=checkpoint,
+                )
+
+            with patch.object(
+                orchestrator.extractor,
+                "extract_and_store",
+                side_effect=fail_first_window,
+            ):
+                store = orchestrator.run(txt, only_chapter=0)
+
+            chapter = store.load_chapter(0)
+            self.assertEqual(chapter.text_segments[0].target, self.FIX_TEXT)
+            with open(store.event_log_path, encoding="utf-8") as f:
+                events = [json.loads(line) for line in f if line.strip()]
+            event_names = [event["event"] for event in events]
+            failure_index = next(
+                index
+                for index, event in enumerate(events)
+                if event["event"] == "glossary_extraction_failed"
+                and event.get("phase") == "chapter_window"
+                and event.get("error_kind") == "terms_missing"
+            )
+            autofix_index = event_names.index("autofix_applied")
+            derived_index = event_names.index("chapter_glossary_derived")
+            self.assertLess(failure_index, autofix_index)
+            self.assertLess(autofix_index, derived_index)
+            refreshed = [
+                event
+                for event in events
+                if event["event"] == "glossary_post_review_refreshed"
+                and event.get("chapter") == 0
+            ]
+            self.assertTrue(refreshed)
+            self.assertTrue(refreshed[-1]["completed"])
+
+            units = chapter.meta["glossary_plan"]["units"]
+            plan = chapter.meta["chapter_glossary_plan"]
+            batches = Orchestrator._batch_glossary_checkpoints(
+                0, chapter.text_segments, units
+            )
+            windows = Orchestrator._chapter_glossary_window_checkpoints(
+                0, chapter.text_segments, plan
+            )
+            glossary = store.open_glossary()
+            self.assertTrue(glossary.chapter_completion_matches_v2(
+                chapter=0,
+                plan_fingerprint=plan["fingerprint"],
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            ))
+            glossary.close()
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_DONE,
             )
 
     def test_backtranslation_uses_final_autofix_targets_and_chapter_indices(self):
@@ -1151,6 +1250,18 @@ class TestGlossaryCheckpointResume(unittest.TestCase):
         return path
 
     @staticmethod
+    def _write_windowed_book(root: str) -> str:
+        """Seven paragraphs become seven canonical units at a one-char budget."""
+        path = os.path.join(root, "windowed.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(
+                f"夏帆ちゃんは第{index}地点を調査した。"
+                for index in range(7)
+            ))
+            f.write("\n")
+        return path
+
+    @staticmethod
     def _checkpoint_config(root: str, *, batch_chars: int = 10_000):
         cfg = _config(os.path.join(root, "state"))
         cfg.segment.max_chars_per_batch = batch_chars
@@ -1196,6 +1307,135 @@ class TestGlossaryCheckpointResume(unittest.TestCase):
             and "抽取器" in c["messages"][0]["content"]
             for c in client.calls
         )
+
+    def _completed_windowed_run(self, root: str):
+        txt = self._write_windowed_book(root)
+        cfg = self._checkpoint_config(root, batch_chars=1)
+        store = Orchestrator(
+            cfg,
+            client=FakeClient(handler=self._handler()),
+        ).run(txt)
+        chapter = store.load_chapter(0)
+        units = chapter.meta["glossary_plan"]["units"]
+        plan = chapter.meta["chapter_glossary_plan"]
+        self.assertEqual(len(units), 7)
+        self.assertGreaterEqual(len(plan["windows"]), 3)
+        return txt, cfg, store, chapter, units, plan
+
+    def test_failed_window_resume_retries_only_that_window_then_is_idempotent(self):
+        """One v2 window protocol failure leaves recoverable, exact progress."""
+        from trans_novel.glossary.extractor import (
+            GlossaryExtractionError,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            txt = self._write_windowed_book(d)
+            cfg = self._checkpoint_config(d, batch_chars=1)
+            orchestrator = Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler()),
+            )
+            original = orchestrator.extractor.extract_and_store
+            failed = False
+
+            def fail_first_window(
+                glossary,
+                source_text,
+                target_text,
+                chapter,
+                *,
+                checkpoint=None,
+            ):
+                nonlocal failed
+                if (
+                    checkpoint is not None
+                    and checkpoint.scope == "chapter_window"
+                    and not failed
+                ):
+                    failed = True
+                    raise GlossaryExtractionError("terms_missing")
+                return original(
+                    glossary,
+                    source_text,
+                    target_text,
+                    chapter,
+                    checkpoint=checkpoint,
+                )
+
+            with patch.object(
+                orchestrator.extractor,
+                "extract_and_store",
+                side_effect=fail_first_window,
+            ):
+                store = orchestrator.run(txt)
+
+            chapter = store.load_chapter(0)
+            plan = chapter.meta["chapter_glossary_plan"]
+            self.assertEqual(len(chapter.meta["glossary_plan"]["units"]), 7)
+            failures = [
+                event
+                for event in self._events(store)
+                if event["event"] == "glossary_extraction_failed"
+                and event.get("phase") == "chapter_window"
+            ]
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0]["error_kind"], "terms_missing")
+            manifest = store.load_manifest()
+            self.assertEqual(manifest["chapters"][0]["status"], STATUS_DONE)
+            self.assertEqual(
+                manifest["chapters"][0]["glossary_status"],
+                STATUS_PENDING,
+            )
+            self.assertEqual(manifest["titles_status"], STATUS_PENDING)
+            self.assertNotIn("title_translated", manifest["chapters"][0])
+
+            glossary = store.open_glossary()
+            parent_count = glossary.conn.execute(
+                "SELECT COUNT(*) FROM glossary_extraction_checkpoints "
+                "WHERE scope='chapter' AND chapter=0"
+            ).fetchone()[0]
+            window_count = glossary.conn.execute(
+                "SELECT COUNT(*) FROM glossary_chapter_window_checkpoints "
+                "WHERE chapter=0 AND plan_fingerprint=?",
+                (plan["fingerprint"],),
+            ).fetchone()[0]
+            glossary.close()
+            self.assertEqual(parent_count, 0)
+            self.assertEqual(window_count, len(plan["windows"]) - 1)
+
+            targets_before = [
+                segment.target for segment in chapter.text_segments
+            ]
+            context_before = store.load_context()
+            event_offset = len(self._events(store))
+            resumed = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=resumed).run(txt)
+
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertEqual(self._glossary_call_count(resumed), 1)
+            delta = self._events(store)[event_offset:]
+            extracted = [
+                event
+                for event in delta
+                if event["event"] == "chapter_glossary_window_extracted"
+            ]
+            self.assertEqual(len(extracted), 1)
+            self.assertEqual(
+                [segment.target for segment in store.load_chapter(0).text_segments],
+                targets_before,
+            )
+            self.assertEqual(store.load_context(), context_before)
+            manifest = store.load_manifest()
+            self.assertEqual(
+                manifest["chapters"][0]["glossary_status"],
+                STATUS_DONE,
+            )
+            self.assertEqual(manifest["titles_status"], STATUS_DONE)
+            self.assertTrue(manifest["chapters"][0].get("title_translated"))
+
+            idempotent = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=idempotent).run(txt)
+            self.assertEqual(idempotent.calls, [])
 
     def test_model_failure_keeps_translation_done_and_retries_only_glossary(self):
         """模型协议失败不丢译文；续跑只补术语，不再次调用译者。"""
@@ -1373,25 +1613,32 @@ class TestGlossaryCheckpointResume(unittest.TestCase):
             )
 
     def test_done_manifest_is_reopened_when_chapter_checkpoint_is_missing(self):
-        """Explicit done is only a projection; SQLite completion is audited."""
+        """Missing v2 parent is re-derived from retained exact children."""
         with tempfile.TemporaryDirectory() as d:
-            txt = self._write_book(d)
-            cfg = self._checkpoint_config(d)
-            store = Orchestrator(
-                cfg,
-                client=FakeClient(handler=self._handler()),
-            ).run(txt)
+            txt, cfg, store, chapter, units, plan = (
+                self._completed_windowed_run(d)
+            )
+            batches = Orchestrator._batch_glossary_checkpoints(
+                0, chapter.text_segments, units
+            )
+            windows = Orchestrator._chapter_glossary_window_checkpoints(
+                0, chapter.text_segments, plan
+            )
             glossary = store.open_glossary()
             glossary.conn.execute(
                 "DELETE FROM glossary_extraction_checkpoints "
-                "WHERE scope='chapter' AND chapter=0"
+                "WHERE scope='chapter' AND chapter=0 AND version=2"
             )
             glossary.conn.commit()
+            self.assertTrue(all(
+                glossary.checkpoint_matches(checkpoint)
+                for checkpoint in batches + windows
+            ))
             glossary.close()
 
-            Orchestrator(
-                cfg, client=FakeClient(handler=self._handler())
-            ).prepare(txt)
+            prepare_client = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=prepare_client).prepare(txt)
+            self.assertEqual(prepare_client.calls, [])
             self.assertEqual(
                 store.load_manifest()["chapters"][0]["glossary_status"],
                 STATUS_PENDING,
@@ -1400,7 +1647,163 @@ class TestGlossaryCheckpointResume(unittest.TestCase):
             resumed = FakeClient(handler=self._handler())
             Orchestrator(cfg, client=resumed).run(txt)
             self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertEqual(self._glossary_call_count(resumed), 0)
+            self.assertIn(
+                "chapter_glossary_derived",
+                [event["event"] for event in self._events(store)],
+            )
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_DONE,
+            )
+
+            glossary = store.open_glossary()
+            self.assertTrue(glossary.chapter_completion_matches_v2(
+                chapter=0,
+                plan_fingerprint=plan["fingerprint"],
+                batch_checkpoints=batches,
+                window_checkpoints=windows,
+            ))
+            glossary.close()
+
+    def test_missing_window_child_reopens_and_retries_only_that_window(self):
+        """A retained parent cannot hide one missing v2 window child."""
+        with tempfile.TemporaryDirectory() as d:
+            txt, cfg, store, chapter, units, plan = (
+                self._completed_windowed_run(d)
+            )
+            windows = Orchestrator._chapter_glossary_window_checkpoints(
+                0, chapter.text_segments, plan
+            )
+            missing = windows[1]
+            glossary = store.open_glossary()
+            parent_count = glossary.conn.execute(
+                "SELECT COUNT(*) FROM glossary_extraction_checkpoints "
+                "WHERE scope='chapter' AND chapter=0 AND version=2"
+            ).fetchone()[0]
+            glossary.conn.execute(
+                "DELETE FROM glossary_chapter_window_checkpoints "
+                "WHERE chapter=0 AND start_index=?",
+                (missing.start_index,),
+            )
+            glossary.conn.commit()
+            glossary.close()
+            self.assertEqual(parent_count, 1)
+
+            Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler()),
+            ).prepare(txt)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_PENDING,
+            )
+
+            event_offset = len(self._events(store))
+            resumed = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=resumed).run(txt)
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
             self.assertEqual(self._glossary_call_count(resumed), 1)
+            delta = self._events(store)[event_offset:]
+            extracted = [
+                event
+                for event in delta
+                if event["event"] == "chapter_glossary_window_extracted"
+            ]
+            self.assertEqual(
+                [(event["start_index"], event["count"]) for event in extracted],
+                [(missing.start_index, missing.count)],
+            )
+            skipped = [
+                event
+                for event in delta
+                if event["event"] == "chapter_glossary_window_skipped"
+            ]
+            self.assertEqual(len(skipped), len(windows) - 1)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_DONE,
+            )
+
+    def test_changed_overlap_unit_refreshes_exact_batch_and_windows(self):
+        """Target drift invalidates one unit and only its two overlapping windows."""
+        with tempfile.TemporaryDirectory() as d:
+            txt, cfg, store, chapter, units, plan = (
+                self._completed_windowed_run(d)
+            )
+            changed_unit = units[2]
+            changed_index = changed_unit["start_index"]
+            affected_windows = [
+                window
+                for window in plan["windows"]
+                if window["start_index"]
+                <= changed_index
+                < window["start_index"] + window["count"]
+            ]
+            unaffected_windows = [
+                window
+                for window in plan["windows"]
+                if window not in affected_windows
+            ]
+            self.assertEqual(len(affected_windows), 2)
+            self.assertTrue(unaffected_windows)
+
+            chapter.text_segments[changed_index].target += "（人工修订）"
+            store.save_chapter(chapter)
+            Orchestrator(
+                cfg,
+                client=FakeClient(handler=self._handler()),
+            ).prepare(txt)
+            self.assertEqual(
+                store.load_manifest()["chapters"][0]["glossary_status"],
+                STATUS_PENDING,
+            )
+
+            event_offset = len(self._events(store))
+            resumed = FakeClient(handler=self._handler())
+            Orchestrator(cfg, client=resumed).run(txt)
+            self.assertEqual(_translated_para_count(resumed.calls), 0)
+            self.assertEqual(self._glossary_call_count(resumed), 3)
+            delta = self._events(store)[event_offset:]
+            batches = [
+                event
+                for event in delta
+                if event["event"] == "batch_glossary_extracted"
+            ]
+            self.assertEqual(
+                [(event["start_index"], event["count"]) for event in batches],
+                [(changed_unit["start_index"], changed_unit["count"])],
+            )
+            extracted_windows = [
+                event
+                for event in delta
+                if event["event"] == "chapter_glossary_window_extracted"
+            ]
+            self.assertEqual(
+                {
+                    (event["start_index"], event["count"])
+                    for event in extracted_windows
+                },
+                {
+                    (window["start_index"], window["count"])
+                    for window in affected_windows
+                },
+            )
+            skipped_windows = [
+                event
+                for event in delta
+                if event["event"] == "chapter_glossary_window_skipped"
+            ]
+            self.assertEqual(
+                {
+                    (event["start_index"], event["count"])
+                    for event in skipped_windows
+                },
+                {
+                    (window["start_index"], window["count"])
+                    for window in unaffected_windows
+                },
+            )
             self.assertEqual(
                 store.load_manifest()["chapters"][0]["glossary_status"],
                 STATUS_DONE,

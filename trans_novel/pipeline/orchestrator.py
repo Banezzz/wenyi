@@ -35,6 +35,13 @@ from ..agents.reviewer import Reviewer, BackTranslator
 from ..agents.polisher import Polisher
 from . import checks
 from .context import RollingContext
+from .glossary_windows import (
+    batch_glossary_checkpoints,
+    chapter_glossary_window_checkpoints,
+    chapter_glossary_windows,
+    expected_chapter_glossary_plan,
+    reconcile_chapter_glossary,
+)
 from .runstore import (
     GLOSSARY_DONE,
     GLOSSARY_PENDING,
@@ -288,7 +295,7 @@ class Orchestrator:
         for entry in manifest.get("chapters", []):
             chapter = store.load_chapter(entry["index"])
             has_plan = "glossary_plan" in chapter.meta
-            plan = chapter.meta.get("glossary_plan")
+            has_chapter_plan = "chapter_glossary_plan" in chapter.meta
             has_status = "glossary_status" in entry
             has_legacy_marker = "glossary_legacy" in entry
             if has_legacy_marker and (
@@ -343,6 +350,15 @@ class Orchestrator:
             units = self._canonical_glossary_units(
                 chapter, chapter.text_segments, store
             )
+            chapter_plan = None
+            if has_chapter_plan:
+                chapter_plan = self._chapter_glossary_windows(
+                    chapter,
+                    chapter.text_segments,
+                    units,
+                    store,
+                    create=False,
+                )
             if status == GLOSSARY_PENDING:
                 continue
             complete = all(
@@ -362,7 +378,7 @@ class Orchestrator:
                     )):
                         complete = False
                         break
-            if complete:
+            if complete and chapter_plan is None:
                 complete = glossary.checkpoint_matches(GlossaryCheckpoint(
                     scope="chapter",
                     chapter=chapter.index,
@@ -370,6 +386,19 @@ class Orchestrator:
                     count=len(chapter.text_segments),
                     fingerprint=translation_fingerprint(chapter.text_segments),
                 ))
+            elif complete:
+                batches = self._batch_glossary_checkpoints(
+                    chapter.index, chapter.text_segments, units
+                )
+                windows = self._chapter_glossary_window_checkpoints(
+                    chapter.index, chapter.text_segments, chapter_plan
+                )
+                complete = glossary.chapter_completion_matches_v2(
+                    chapter=chapter.index,
+                    batch_checkpoints=batches,
+                    window_checkpoints=windows,
+                    plan_fingerprint=chapter_plan["fingerprint"],
+                )
             if complete:
                 continue
             store.set_chapter_glossary_status(chapter.index, GLOSSARY_PENDING)
@@ -708,12 +737,14 @@ class Orchestrator:
             m["titles_status"] = STATUS_DONE
             store.save_manifest(m)
             return
+        all_terms = glossary.all_terms()
+        title_terms = GlossaryStore.terms_in(all_terms, "\n".join(titles))
         system = prompts.render("title_translator_system",
                                 src=self.config.source_lang, tgt=self.config.target_lang,
                                 n=len(titles))
         user = prompts.render("title_translator_user",
                               src=self.config.source_lang, tgt=self.config.target_lang,
-                              glossary=prompts.render_glossary(glossary.all_terms()),
+                              glossary=prompts.render_glossary(title_terms),
                               n=len(titles), numbered_titles=prompts.numbered(titles))
         try:
             data = self.client.complete_json(
@@ -751,6 +782,8 @@ class Orchestrator:
         store.save_manifest(m)
         store.log_event(
             "titles_translated",
+            reference_terms_total=len(all_terms),
+            reference_terms_selected=len(title_terms),
             titles=[
                 {"index": i - 1, "source": src, "target": tgt}
                 for i, (src, tgt) in enumerate(zip(titles, out))
@@ -909,30 +942,17 @@ class Orchestrator:
             if changed:
                 term_snapshot = self._chapter_term_snapshot(glossary, text_segs)
 
-        chapter_fingerprint = translation_fingerprint(text_segs)
-        chapter_checkpoint = GlossaryCheckpoint(
-            scope="chapter",
-            chapter=ci,
-            start_index=0,
-            count=len(text_segs),
-            fingerprint=chapter_fingerprint,
-        )
         if all(s.target and s.target.strip() for s in text_segs):
-            if glossary.checkpoint_matches(chapter_checkpoint):
-                store.log_event(
-                    "chapter_glossary_skipped",
-                    chapter=ci,
-                    fingerprint=chapter_fingerprint,
-                    reason="checkpoint_match",
-                )
-            else:
-                summary = self._extract_glossary(
-                    glossary, store, ci, text_segs,
-                    phase="chapter", checkpoint=chapter_checkpoint,
-                )
-                glossary_complete &= summary is not None
-                if summary is not None:
-                    term_snapshot = self._chapter_term_snapshot(glossary, text_segs)
+            chapter_complete, chapter_changed = self._reconcile_chapter_glossary(
+                glossary,
+                store,
+                chapter,
+                text_segs,
+                units,
+            )
+            glossary_complete &= chapter_complete
+            if chapter_changed:
+                term_snapshot = self._chapter_term_snapshot(glossary, text_segs)
         else:
             glossary_complete = False
 
@@ -990,7 +1010,7 @@ class Orchestrator:
             glossary_complete, term_snapshot = self._refresh_changed_glossary(
                 glossary,
                 store,
-                ci,
+                chapter,
                 text_segs,
                 units,
                 changed_targets,
@@ -1139,6 +1159,32 @@ class Orchestrator:
             ) from exc
         return units
 
+    _batch_glossary_checkpoints = staticmethod(batch_glossary_checkpoints)
+    _expected_chapter_glossary_plan = staticmethod(
+        expected_chapter_glossary_plan
+    )
+    _chapter_glossary_windows = staticmethod(chapter_glossary_windows)
+    _chapter_glossary_window_checkpoints = staticmethod(
+        chapter_glossary_window_checkpoints
+    )
+
+    def _reconcile_chapter_glossary(
+        self,
+        glossary: GlossaryStore,
+        store: RunStore,
+        chapter,
+        text_segs,
+        units: list[dict],
+    ) -> tuple[bool, bool]:
+        return reconcile_chapter_glossary(
+            glossary=glossary,
+            store=store,
+            chapter=chapter,
+            text_segs=text_segs,
+            units=units,
+            extract_glossary=self._extract_glossary,
+        )
+
     @staticmethod
     def _translation_runs(batch) -> list[tuple[int, list, bool]]:
         """按 target 是否已存在切连续段，已保存段永不再次送给译者。"""
@@ -1165,6 +1211,13 @@ class Orchestrator:
         phase: str,
         checkpoint: GlossaryCheckpoint,
     ) -> dict[str, int] | None:
+        events = {
+            "batch": "batch_glossary_extracted",
+            "chapter_window": "chapter_glossary_window_extracted",
+            "chapter": "chapter_glossary_extracted",
+        }
+        if phase not in events:
+            raise ValueError(f"unsupported glossary extraction phase: {phase}")
         src_text = "\n".join(segment.source for segment in segments)
         tgt_text = "\n".join(segment.target or "" for segment in segments)
         try:
@@ -1183,6 +1236,7 @@ class Orchestrator:
                 start_index=checkpoint.start_index,
                 count=checkpoint.count,
                 fingerprint=checkpoint.fingerprint,
+                plan_fingerprint=checkpoint.plan_fingerprint or None,
                 error_kind=exc.kind,
             )
             return None
@@ -1195,6 +1249,7 @@ class Orchestrator:
                 start_index=checkpoint.start_index,
                 count=checkpoint.count,
                 fingerprint=checkpoint.fingerprint,
+                plan_fingerprint=checkpoint.plan_fingerprint or None,
                 summary=exc.summary,
                 error=f"{type(cause).__name__}: {cause}"[:500],
             )
@@ -1207,25 +1262,26 @@ class Orchestrator:
                 start_index=checkpoint.start_index,
                 count=checkpoint.count,
                 fingerprint=checkpoint.fingerprint,
+                plan_fingerprint=checkpoint.plan_fingerprint or None,
                 error=f"{type(exc).__name__}: {exc}"[:500],
             )
             raise
 
-        event = (
-            "batch_glossary_extracted"
-            if phase == "batch"
-            else "chapter_glossary_extracted"
-        )
+        event_data = {
+            "chapter": chapter,
+            "start_index": checkpoint.start_index,
+            "count": checkpoint.count,
+            "summary": summary,
+            "fingerprint": checkpoint.fingerprint,
+            "checkpoint_version": checkpoint.version,
+            "completed": True,
+            "generation_id": glossary.generation_id,
+        }
+        if checkpoint.plan_fingerprint:
+            event_data["plan_fingerprint"] = checkpoint.plan_fingerprint
         store.log_event(
-            event,
-            chapter=chapter,
-            start_index=checkpoint.start_index,
-            count=checkpoint.count,
-            summary=summary,
-            fingerprint=checkpoint.fingerprint,
-            checkpoint_version=checkpoint.version,
-            completed=True,
-            generation_id=glossary.generation_id,
+            events[phase],
+            **event_data,
         )
         return summary
 
@@ -1233,7 +1289,7 @@ class Orchestrator:
         self,
         glossary: GlossaryStore,
         store: RunStore,
-        chapter: int,
+        chapter,
         text_segs,
         units: list[dict],
         changed_indices: set[int],
@@ -1241,6 +1297,7 @@ class Orchestrator:
         term_snapshot: list,
     ) -> tuple[bool, list]:
         """审校自动修订 target 后刷新受影响 unit 与章级 checkpoint。"""
+        chapter_index = chapter.index
         refreshed_units: list[int] = []
         for unit in units:
             start = unit["start_index"]
@@ -1253,7 +1310,7 @@ class Orchestrator:
                 continue
             checkpoint = GlossaryCheckpoint(
                 scope="batch",
-                chapter=chapter,
+                chapter=chapter_index,
                 start_index=start,
                 count=len(segments),
                 fingerprint=translation_fingerprint(segments),
@@ -1262,7 +1319,7 @@ class Orchestrator:
                 summary = self._extract_glossary(
                     glossary,
                     store,
-                    chapter,
+                    chapter_index,
                     segments,
                     phase="batch",
                     checkpoint=checkpoint,
@@ -1273,30 +1330,21 @@ class Orchestrator:
             refreshed_units.append(start)
 
         if all(s.target and s.target.strip() for s in text_segs):
-            checkpoint = GlossaryCheckpoint(
-                scope="chapter",
-                chapter=chapter,
-                start_index=0,
-                count=len(text_segs),
-                fingerprint=translation_fingerprint(text_segs),
+            chapter_complete, chapter_changed = self._reconcile_chapter_glossary(
+                glossary,
+                store,
+                chapter,
+                text_segs,
+                units,
             )
-            if not glossary.checkpoint_matches(checkpoint):
-                summary = self._extract_glossary(
-                    glossary,
-                    store,
-                    chapter,
-                    text_segs,
-                    phase="chapter",
-                    checkpoint=checkpoint,
-                )
-                complete &= summary is not None
-                if summary is not None:
-                    term_snapshot = self._chapter_term_snapshot(glossary, text_segs)
+            complete = chapter_complete
+            if chapter_changed:
+                term_snapshot = self._chapter_term_snapshot(glossary, text_segs)
         else:
             complete = False
         store.log_event(
             "glossary_post_review_refreshed",
-            chapter=chapter,
+            chapter=chapter_index,
             changed_indices=sorted(changed_indices),
             unit_starts=refreshed_units,
             completed=complete,
