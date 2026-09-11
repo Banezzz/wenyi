@@ -90,13 +90,11 @@ uv sync
 
 ### Configuration
 
-Set your API key. This fork's sample `config.yaml` uses LongCat:
+Set your API key. This fork's sample `config.yaml` uses Alibaba Cloud Model Studio (`deepseek-v4-flash-0731`):
 
 ```bash
-export LONGCAT_API_KEY=sk-...
+export DASHSCOPE_API_KEY=sk-...
 ```
-
-DeepSeek remains available with `llm.preset: deepseek` and `DEEPSEEK_API_KEY`.
 
 ### One-command translation
 

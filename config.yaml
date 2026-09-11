@@ -6,10 +6,46 @@ language:
   target: zh # Target: zh / zh-Hant / en / ja / ko / fr / de / es / it / pt / ru; run languages for the full list
 
 # ── LLM ──────────────────────────────────────────────────────────────────
+# Alibaba Cloud Model Studio (Singapore workspace token-plan).
+# OpenAI-compatible Chat Completions is the protocol this app uses.
+# Anthropic-compatible URL exists at .../apps/anthropic but is not wired here.
+# API key: export DASHSCOPE_API_KEY=...  (never put the key in this file)
 llm:
-  preset: longcat # All tiers: LongCat-2.0; strong/cheap thinking on, fast thinking off
-  # Other presets: deepseek, gemini, fake. Add providers, models and routes to override operations.
-  # Inspect effective settings with: trans-novel models list
+  providers:
+    default:
+      kind: openai-compatible
+      base_url: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      api_key_env: DASHSCOPE_API_KEY
+  models:
+    default_strong:
+      provider: default
+      model: deepseek-v4-flash-0731
+      options:
+        thinking: true
+        json_response_fallback: reasoning_content
+        request_overrides:
+          enable_thinking: true
+          reasoning_effort: high
+    default_cheap:
+      provider: default
+      model: deepseek-v4-flash-0731
+      options:
+        thinking: true
+        json_response_fallback: reasoning_content
+        request_overrides:
+          enable_thinking: true
+          reasoning_effort: high
+    default_fast:
+      provider: default
+      model: deepseek-v4-flash-0731
+      options:
+        thinking: false
+        request_overrides:
+          enable_thinking: false
+  tiers:
+    strong: default_strong
+    cheap: default_cheap
+    fast: default_fast
 
 # ── Segmentation ─────────────────────────────────────────────────────────────────
 segment:
