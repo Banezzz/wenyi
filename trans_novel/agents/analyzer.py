@@ -40,6 +40,7 @@ class Analyzer(Agent):
                 if isinstance(item, str) and item.strip()
             )
         for key in (
+            "content_type",
             "genre",
             "tone",
             "style_guide",
@@ -101,6 +102,8 @@ class Analyzer(Agent):
     def style_brief(self, analysis: dict[str, Any]) -> str:
         """Condense analysis into a style and character brief for the translator."""
         lines = []
+        if analysis.get("content_type"):
+            lines.append(f"Content type: {analysis['content_type']}")
         if analysis.get("genre"):
             lines.append(f"Genre: {analysis['genre']}")
         if analysis.get("tone"):

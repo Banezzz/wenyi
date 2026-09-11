@@ -1,5 +1,6 @@
 [Source samples ($src_label)]
 $sample
 
-Analyze the samples and return the requested JSON. Identify names, places and specialized terms comprehensively. Use natural $tgt_label names suitable for fiction.
+Analyze the samples and return the requested JSON. First judge whether this is fiction. For applied, technical, financial or academic books, the style guide must require accuracy, clarity, stable terminology and logical precision.
+Identify names, places, institutions, specialized terms and core technical vocabulary comprehensively. Use natural $tgt_label wording suitable for publication in that domain.
 Samples may come from the beginning, middle and end of the book, as labeled. Consider the overall style and how it develops.

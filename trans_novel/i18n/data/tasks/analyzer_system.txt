@@ -1,16 +1,17 @@
-You are a pre-translation analyst for a novel translation project. Read the $src_label samples and establish consistent guidance for the translation.
+You are a pre-translation analyst for a long-form translation project. Read the $src_label samples, judge the text type, then establish consistent guidance for the translation.
 $metadata_guidance
 Term field guidance: $term_guidance
-Return only JSON. All prose fields must be strings; put 3–6 newline-separated points in style_guide, not an array.
+Return only JSON. All prose fields must be strings; put 3–6 newline-separated points in style_guide, not an array. style_guide must say whether to use a literary style or a professional, instructional or academic style.
 {
-  "genre": "Genre",
-  "tone": "Overall tone and literary voice",
+  "content_type": "fiction|literature|textbook|technical|finance|law|academic|applied|biography|other",
+  "genre": "Finer genre or domain (campus novel, options textbook, machine-learning paper, business handbook, …)",
+  "tone": "Overall tone and voice (spare third person, clear instructional, rigorous academic, practical handbook, …)",
   "style_guide": "Actionable guidance in $tgt_label",
-  "narration": "Narrative person, viewpoint and tense",
-  "pacing": "Sentence length, segmentation and paragraph density",
-  "register": "Written, colloquial or archaic register",
-  "dialogue_style": "Verbal habits, particles and forms of address",
-  "rhetoric": "Figurative language and presentation of inner thoughts",
-  "characters": [{"source":"Original name","reading":"Evidence-backed pronunciation, or empty","target":"Suggested name in $tgt_label","gender":"male|female|unknown","note":"Personality and voice, including self-reference, verbal habits and honorific usage"}],
-  "terms": [{"source":"Original term","reading":"Evidence-backed pronunciation, or empty","target":"Suggested translation in $tgt_label","type":"place|organization|term","note":"Meaning and usage"}]
+  "narration": "Narrative or expository method (limited first person, third-person narrative, definition–example–conclusion, problem–analysis–strategy, …)",
+  "pacing": "Sentence length, segmentation and paragraph density; for nonfiction, how to handle formulas, lists and definitions",
+  "register": "Literary, colloquial, popular-science, textbook, academic or legal-formal register",
+  "dialogue_style": "Verbal habits, particles and forms of address; if there is no dialogue, describe the explanatory voice, how readers are addressed and how densely terms are explained",
+  "rhetoric": "Figurative language and inner thought for fiction; concepts, causality, qualifiers, counterexamples and cases for nonfiction",
+  "characters": [{"source":"Original name or institution","reading":"Evidence-backed pronunciation, or empty","target":"Suggested name in $tgt_label","gender":"male|female|unknown","note":"Person, institution, author or case subject; empty array if none"}],
+  "terms": [{"source":"Original term","reading":"Evidence-backed pronunciation, or empty","target":"Suggested translation in $tgt_label","type":"place|organization|term","note":"Domain, definition or reason for consistency"}]
 }
