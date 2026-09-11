@@ -1,0 +1,305 @@
+# 使用指南
+
+[English](../usage.md)
+
+## 安装与运行
+
+从源码运行需要 Python 3.10+ 与 [uv](https://docs.astral.sh/uv/)。
+
+```bash
+uv sync
+export DEEPSEEK_API_KEY=sk-...
+uv run trans-novel --version
+uv run trans-novel translate book.epub
+```
+
+显示的版本号由仓库 Git 标签自动生成：标签构建显示正式版本，开发构建还会包含距标签的提交数与提交哈希。
+
+每次启动程序都会检查当前目录的 `config.yaml`；文件不存在时会创建一份带注释的默认配置。开始正式翻译前请检查模型配置。
+
+## 检查模型路由
+
+```bash
+uv run trans-novel models list
+uv run trans-novel models explain --operation review.fix
+uv run trans-novel models check --for translate
+```
+
+这些命令只做本地预览与密钥检查，不发送请求。三个档位仍可作为默认入口；在 `llm.routes` 中独立配置操作即可混用模型。旧配置与用量账本的显式转换、预算和 `models compare` 用法见[配置说明](configuration.md#模型与操作路由)。
+
+## 多语言互译（实验性）
+
+先运行 `uv run trans-novel languages` 查看内置语言。将以下片段写入自己的配置文件（模型配置沿用已有设置），即可直接中译英：
+
+```yaml
+language:
+  source: zh
+  target: en
+```
+
+```bash
+uv run trans-novel --config config.yaml translate book.epub --bilingual
+```
+
+输出为 `output/book.en.epub` 和 `output/book.en-bi.epub`。日译英改为 `source: ja`、`target: en`；英译日用 `source: en`、`target: ja`。反向翻译以对应语言的文件为输入，每次选择一个方向。`--out` 仍遵循显式命名及 `-bi` 派生规则。
+
+以下 `.zh.*` 示例指默认简体中文目标。所有目标的书籍状态均位于 `state/<书名>/targets/<目标语言>/`，字幕位于 `state/srt/<slug>/targets/<目标语言>/`。续跑和独立阶段命令使用同一目标配置，完成的译文不会因切换回原目标而重新翻译。EPUB 说明页在简体中文目标下为中文，其它目标暂用标记为英语的英文页，可通过 `about_page: false` 关闭。
+
+CLI 的帮助、进度、表格和错误提示统一使用英语。译文和模型生成的说明性元数据使用 `language.target`；`source` 和 `aliases` 中的原文姓名保留用于匹配。续跑复用已有分析和术语备注，本次更新不会自动翻译旧数据。当前不支持阿拉伯语、希伯来语等 RTL 目标；PDF 字体和外部 bridge 的语言支持仍需单独验证。真实长篇翻译质量尚未完成新旧盲评。
+
+## Windows
+
+Windows Release 提供 `wenyi-windows-x64.zip`，运行前请使用
+`SHA256SUMS.txt` 校验文件。
+
+使用打包版 `wenyi.exe` 时，在 PowerShell 中设置 API Key：
+
+```powershell
+# 仅当前窗口有效
+$env:DEEPSEEK_API_KEY = "sk-..."
+.\wenyi.exe translate .\book.epub
+```
+
+要永久保存环境变量，执行下列命令后重新打开 PowerShell：
+
+```powershell
+setx DEEPSEEK_API_KEY "sk-..."
+```
+
+也可把 `language.source` 设为已知的语言代码，避免调用模型自动识别源语言。
+
+## Linux
+
+Release 提供 `wenyi-linux-x64.tar.gz` 和 `wenyi-linux-arm64.tar.gz`。请下载与
+处理器架构匹配的压缩包，使用 `SHA256SUMS.txt` 校验后执行：
+
+```bash
+tar -xzf wenyi-linux-arm64.tar.gz  # x64 系统请改用 wenyi-linux-x64.tar.gz
+chmod +x wenyi
+export DEEPSEEK_API_KEY=sk-...
+./wenyi translate book.epub
+```
+
+## macOS
+
+Release 分别提供适用于 Apple Silicon 的 `wenyi-macos-arm64.tar.gz` 和适用于
+Intel Mac 的 `wenyi-macos-x64.tar.gz` 终端程序。下载与处理器匹配的压缩包，先用
+`SHA256SUMS.txt` 核对文件，再执行：
+
+```bash
+tar -xzf wenyi-macos-arm64.tar.gz  # Intel Mac 请改用 wenyi-macos-x64.tar.gz
+chmod +x wenyi
+export DEEPSEEK_API_KEY=sk-...
+./wenyi translate book.epub
+```
+
+这些命令行程序由 PyInstaller 做 ad-hoc 签名，但没有使用 Apple 开发者证书完成
+notarization。macOS 仍可能隔离下载的程序；确认校验和无误后，如系统提示拦截，
+可在 **系统设置 → 隐私与安全性** 中批准运行。
+
+## 输入与输出
+
+- 输入格式：EPUB、FB2、TXT、Markdown、HTML、PDF、DOCX、SRT。
+- 书籍默认输出：源文件旁 `output/` 下的单语版 `<书名>.zh.epub`（`.docx` 输入默认改为 `<书名>.zh.docx`）；双语版 `*.zh-bi.*` 按需开启。
+- `--format epub|txt|html|markdown|pdf|docx`：书籍导出格式；未指定时 `.docx`→`docx`，其它书籍→`epub`。该选项不适用于 SRT。
+- EPUB 输入会尽量按原 XHTML 模板回填译文，保留样式、图片、目录和锚点。
+- 双语版按段展示译文与原文，原文默认淡化；设置 `output.bilingual_preserve_source_style: true` 可改为继承书籍正文样式。排列顺序由 `output.bilingual_order` 控制。
+- EPUB 默认在书末附加“关于此翻译”说明，可通过 `output.about_page: false` 关闭。
+- 书籍状态位于 `state/<书名>/targets/<目标语言>/`，含章节中间结果、术语 SQLite 库、用量和报告。字幕运行使用独立目录树 `state/srt/`（见 [SRT 字幕](#srt-字幕)）。
+
+### 实验性 PDF 支持
+
+PDF 输入和 PDF 导出目前均属于实验性支持。
+
+#### PDF 输入
+
+默认走 MinerU。也可用外部 **BabelDOC bridge**（AGPL，独立仓库/进程，HTTP only）保留版式：
+
+1. 另仓安装并启动 `wenyi-babeldoc-bridge`（默认 `http://127.0.0.1:8765`）
+2. `config.yaml`：
+
+```yaml
+pipeline:
+  pdf_backend: babeldoc
+  babeldoc_bridge_url: http://127.0.0.1:8765
+  # babeldoc_pages: "15"   # 可选，1-based
+```
+
+3. `uv run trans-novel translate book.pdf` 后 `assemble --format pdf` 会经 bridge `/fillback` 出 PDF。  
+   回填 PDF 默认不绘制 BabelDOC 的版面定位框，也不输出 plain text / title 等角色标签。  
+   bridge 会把抽取后的原始 IL 冻结为持久 session 快照；只要保留 session 目录并使用完全
+   相同的 Python/BabelDOC 版本，服务重启后可按原 session ID 懒恢复，不会重跑版面识别。
+   长时间翻译建议用 `WENYI_BABELDOC_STATE_DIR` 指定持久目录；默认系统临时目录可能在重启
+   系统后被清理。主仓不 import babeldoc。章节按 **PDF 内置 TOC（书签）** 断章；段落仍带
+   `meta.babeldoc_id` 供回填。无书签时退回单章。
+
+BabelDOC 只适合带可提取文本层的 PDF。选择该后端时，Wenyi 会在请求 bridge 前检查所选页面；
+若页面只有扫描图片而没有文本层，会停止并提示改用默认 MinerU，或先进行 OCR。
+
+首次读取 PDF（MinerU）需设置 `MINERU_API_KEY`：
+
+```bash
+export MINERU_API_KEY=...
+uv run trans-novel translate book.pdf
+```
+
+MinerU 转换生成的 HTML 会保存到
+`state/<书名>/targets/<目标语言>/source/<源文件 SHA-256>/converted.html`。按内容隔离缓存，可避免
+初始化中断后把另一份 PDF 的转换结果误用于当前文件。
+后续运行会直接复用该文件，也可人工修正后再续跑。
+
+#### PDF 导出
+
+默认 PDF 引擎为 WeasyPrint。安装对应的可选依赖后，无需指定
+`--pdf-engine`：
+
+```bash
+uv sync --extra pdf-output
+uv run trans-novel assemble book.html --format pdf
+```
+
+如需不依赖系统排版库的跨平台轻量引擎，可使用 `fpdf2`：
+
+```bash
+uv sync --extra pdf-output-lite
+uv run trans-novel assemble book.html --format pdf --pdf-engine fpdf2
+```
+
+`fpdf2` 可处理基础排版和图片，但只支持有限的 HTML/CSS；与文字混排的图片
+会作为独立区块输出。它会查找系统中的中文字体；如果未找到，请用
+`TRANS_NOVEL_PDF_FONT` 指定 TTF、OTF 或 TTC 字体文件。此方案也适用于
+Windows。
+
+## DOCX（Word）
+
+`translate book.docx` 走完整书籍 Orchestrator（术语、润色、审校、`state/<slug>/targets/<目标语言>/` 续跑）。
+
+**结构**
+
+- 段落与标题样式（`Heading 1`–`9` / outline）；一级标题切章。
+- 简易表格按单元格重建（首版不支持合并单元格 / 嵌套表）。
+- Word 自动编号（`numPr`）按组重建为 List Number / List Bullet（按源 list id 分段重开）。
+- 目录一类正文已含 `1. 标题` 可见序号的行**不再**套自动编号，避免双重序号。
+
+**样式**
+
+- 保留加粗 / 斜体 / 下划线 / 颜色 / 字号，以及段落对齐与底纹。
+- 整段同质：导出直接套用，**不**额外调模型。
+- 段内混排：译后对每个有意义的跨度单独定位（仿 EPUB 注释标记）；加粗/颜色等属性从原文 item **继承**。单个跨度失败只比例回退该跨度，不整段作废。
+- 仅 font/size 差异不参与对齐（噪音）。
+- **已译中文**统一**宋体**（不沿用原文西文字体）；**未翻译原文**与双语原文侧不套宋体。
+- 模板 Heading 主题蓝会去掉，除非原文写了显式颜色。
+
+**输出**
+
+- 默认：`output/<stem>.zh.docx`（标题大纲可供 Word 导航窗格）。可用 `--format epub` 等覆盖。
+
+```bash
+uv run trans-novel translate book.docx
+uv run trans-novel translate book.docx --bilingual
+uv run trans-novel translate book.docx --format epub
+```
+
+## SRT 字幕
+
+`translate` 会按扩展名自动分流 `.srt`。字幕路径比书籍管线更轻：
+
+- 滑窗 20 条、重叠 10，最多 100 路并发 strong 档调用；
+- 无术语库、润色或全书审校；
+- `--chapter`、`--polish`、`--review`、`--format` 在不适用时会被忽略或拒绝；
+- 默认写出单语 `output/<stem>.zh.srt`；加 `--bilingual` 可生成 `.zh-bi.srt`。
+
+```bash
+uv run trans-novel translate movie.srt
+uv run trans-novel translate movie.srt --bilingual
+uv run trans-novel translate movie.srt --no-mono --bilingual
+```
+
+再次对同一源文件执行即可续跑；已缓存的
+`state/srt/<slug>/targets/<目标语言>/batches/` 会跳过。目录布局：
+
+```text
+state/srt/<slug>/targets/<目标语言>/
+  manifest.json    # 源身份、字幕条数、滑窗配置
+  cues.jsonl       # 每行一条：index / timestamp / source / target / status
+  batches/         # 模型原始批次结果，供续跑
+  usage.json       # 跨 resume 累计 token
+  events.jsonl     # 运行事件与 LLM 重试观察
+```
+
+字幕路径不会生成 `glossary.db` 或 `reviews/`。包代码在 `trans_novel.srt`
+（store + translate），读写分别在 `ingest.srt_reader` 与 `assemble.srt_writer`。
+
+## 用量与事件日志
+
+每个目标目录的 `usage.json` 保存跨续跑累计的 token 用量，`events.jsonl` 追加记录阶段事件与重试。Review 目录另存本次审校用量，其增量只合并到总账一次。
+
+已移除未启用的 `run_metrics/` 实验账本，不再保留对应计时包装层。
+
+manifest 通过 `source_sha256` 绑定输入内容。同名文件内容不同或状态缺少有效哈希时会拒绝续跑，必须重新建立翻译状态。
+
+## 常用命令
+
+```bash
+# 一键完整翻译、只翻指定章节，或只准备而不翻译
+uv run trans-novel translate book.epub
+uv run trans-novel translate book.epub --chapter 3
+uv run trans-novel translate book.epub --format txt
+uv run trans-novel prepare book.epub
+uv run trans-novel translate book.pdf
+uv run trans-novel translate movie.srt
+
+# 覆盖配置中的润色与最终审校开关
+uv run trans-novel translate book.epub --polish --review
+uv run trans-novel translate book.epub --no-polish --no-review
+
+# 同时生成单语和双语版 / 仅生成双语版
+uv run trans-novel translate book.epub --bilingual
+uv run trans-novel translate book.epub --no-mono --bilingual
+```
+
+`prepare` 会解析书籍、识别语言、生成风格指南和初始术语表，并完成配置中启用的全书预扫，但不翻译任何正文。之后对同一源文件运行 `translate`，即可复用状态继续翻译。
+
+## 中断与续跑
+
+已完成的批次会写入状态目录。中断后使用同一个源文件执行：
+
+```bash
+uv run trans-novel translate book.epub
+uv run trans-novel status book.epub
+```
+
+更改润色设置不会自动重跑已经完成的翻译批次。Review 不同：每次执行
+`review` 都会全量重审完整译文，并创建新的时间戳审校目录。默认保持只读；使用
+`--autofix` 时可以发布最终修订。只有需要从头翻译时
+才应使用新的状态目录或清理对应状态。
+
+## 独立阶段与术语管理
+
+```bash
+uv run trans-novel review book.epub
+uv run trans-novel review book.epub --autofix
+uv run trans-novel glossary list book.epub
+uv run trans-novel glossary conflicts book.epub
+uv run trans-novel glossary resolve book.epub "原文术语" "指定译名"
+uv run trans-novel report book.epub
+uv run trans-novel assemble book.epub
+```
+
+`review` 会使用最终术语库检查完整译文。原有 Reviewer 提示词先并发检查连续
+文本块；候选问题随后可进入有界取证循环，互相矛盾的跨块一致性建议还可获得
+终局建议。确认的问题可以生成仅限本次运行的完整单段影子替换；同轮 Fixer 都读取
+同一份不可变快照，下一轮全书 Review 不接收旧问题说明，只盲审更新后的影子译文。
+默认情况下，这些替换不会写回。使用 `--autofix`（或设置
+`pipeline.review_autofix: true`）时，会先叠加折叠后的 `changes`；剩余 issues
+基于更新后的译文复用同一个有界 Review Agent Loop，确认项再复用同一个 Review
+Fixer。最终完整段落只写入章节 `target`，不会给章节 JSON 增加 Review 历史字段，
+也不修改 manifest 和术语库。每次运行会把面向用户的统一 `result.json`、本次模型用量、事件和内部逐轮记录写入
+`state/<书名>/targets/<目标语言>/reviews/review-<时间戳>/`。同一份用量增量还会且只会计入一次
+本书累计 `usage.json`。Autofix 的完整前后版本链、issue 判定、失败原因和幂等
+写回日志保存在 `autofix/index.json`；发布后会刷新注释与 DOCX 样式偏移。
+`report.json` 保存简短的 Review 与 Autofix 摘要。
+
+`report` 汇总当前翻译状态和最新 Review 结果，不会修改正文；`assemble` 可在
+不重新调用模型的情况下重新导出已有译文。若另一个终端仍在翻译，导出会读取
+调用时已经落盘的一致快照，不必等到整本书结束；之后新完成的批次需再次导出才会进入成品。

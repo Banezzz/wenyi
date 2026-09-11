@@ -1,191 +1,211 @@
-"""术语抽取 Agent（廉价档）+ 原子入库。"""
+"""Extract glossary terms with an economical model and persist actual translations.
+Extract proper names from source/target pairs after translation. GlossaryStore.upsert_term
+records alternate translations as conflicts for human resolution.
+"""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 
 from ..agents import prompts
 from ..agents.base import Agent
-from .store import GlossaryCheckpoint, GlossaryStore, GlossaryTerm
+from ..config import Config
+from ..i18n.prompts import render
+from ..llm.base import LLMClient
+from .store import (
+    TYPE_TERM,
+    GlossaryOccurrenceMatcher,
+    GlossaryStore,
+    GlossaryTerm,
+    source_matches_text,
+)
 
 
-class GlossaryExtractionError(RuntimeError):
-    """模型调用或响应契约失败；不代表 SQLite 持久化失败。"""
-
-    def __init__(self, kind: str):
-        super().__init__(kind)
-        self.kind = kind
-
-
-class GlossaryPersistenceError(RuntimeError):
-    """术语持久化失败；事务已回滚，调用方必须停止并上报。"""
-
-    def __init__(self, summary: dict[str, int]):
-        super().__init__("glossary persistence failed")
-        self.summary = summary
+def _text(value: object, default: str = "") -> str:
+    """Normalize scalar model fields to strings."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return default
 
 
 @dataclass(frozen=True)
-class _ParsedTerms:
-    terms: list[GlossaryTerm]
-    stats: dict[str, int]
+class TranslatedSegmentEvidence:
+    """A translated paragraph and its book position for tracing a new term's first translation."""
 
-
-GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS = 30_000
-
-
-def _serialized_prompt_chars(system: str, user: str) -> int:
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    return len(json.dumps(
-        messages,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ))
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant: {value}")
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def _was_normalized(raw: dict[str, Any], term: GlossaryTerm) -> bool:
-    """只统计响应中实际出现且被改写的字段，不把缺省字段算作归一化。"""
-    for name in ("source", "target", "reading", "type", "gender", "aliases", "note"):
-        if name in raw and raw[name] != getattr(term, name):
-            return True
-    return False
+    chapter: int
+    segment: int
+    source: str
+    target: str
 
 
 class GlossaryExtractor(Agent):
-    def _ask_strict_json(self, system: str, user: str) -> Any:
-        text = self.client.complete(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            tier="fast",
-            json_mode=True,
-        )
-        return json.loads(
-            (text or "").strip(),
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_reject_duplicate_json_keys,
-        )
+    def __init__(self, client: LLMClient, config: Config):
+        super().__init__(client, config)
+        self._recurrence_corpus: str | None = None
+        self._recurrence_matcher: GlossaryOccurrenceMatcher | None = None
+        self._recurrence_cache: dict[tuple[str, str, tuple[str, ...]], bool] = {}
 
-    def _render_bounded_prompt(
+    def _recurring_existing_terms(
         self,
-        source_text: str,
-        target_text: str,
-        existing: list[GlossaryTerm],
-    ) -> tuple[str, str, list[GlossaryTerm], int, int]:
-        """Render the exact request, dropping only whole reference entries."""
-        system = prompts.render("glossary_extractor_system", src=self.src, tgt=self.tgt)
+        terms: list[GlossaryTerm],
+        source_corpus: str,
+    ) -> list[GlossaryTerm]:
+        """Return existing terms occurring at least twice in the book and cache per-term
+        matches.
+        """
+        if source_corpus is not self._recurrence_corpus:
+            self._recurrence_corpus = source_corpus
+            self._recurrence_matcher = GlossaryOccurrenceMatcher(source_corpus)
+            self._recurrence_cache.clear()
 
-        def render(selected: list[GlossaryTerm]) -> tuple[str, str, int]:
-            rendered = prompts.render_glossary(selected)
-            user = prompts.render(
-                "glossary_extractor_user",
-                src=self.src,
-                tgt=self.tgt,
-                glossary=rendered,
-                source=source_text,
-                target=target_text,
-            )
-            return rendered, user, _serialized_prompt_chars(system, user)
+        assert self._recurrence_matcher is not None
+        missing: list[GlossaryTerm] = []
+        for term in terms:
+            signature = (term.source, term.type, tuple(term.aliases))
+            if signature not in self._recurrence_cache:
+                missing.append(term)
 
-        rendered_glossary, user, prompt_chars = render([])
-        if prompt_chars > GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS:
-            raise GlossaryExtractionError("prompt_too_large")
+        if missing:
+            matched = {
+                (term.source, term.type, tuple(term.aliases))
+                for term in self._recurrence_matcher.recurring_terms(missing)
+            }
+            for term in missing:
+                signature = (term.source, term.type, tuple(term.aliases))
+                self._recurrence_cache[signature] = signature in matched
 
-        selected: list[GlossaryTerm] = []
-        for term in existing:
-            candidate = [*selected, term]
-            candidate_glossary, candidate_user, candidate_chars = render(candidate)
-            if candidate_chars > GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS:
-                continue
-            selected = candidate
-            rendered_glossary = candidate_glossary
-            user = candidate_user
-            prompt_chars = candidate_chars
-
-        return system, user, selected, len(rendered_glossary), prompt_chars
-
-    def _extract_with_stats(
-        self,
-        source_text: str,
-        target_text: str,
-        existing: list[GlossaryTerm],
-        *,
-        reference_total: int | None = None,
-    ) -> _ParsedTerms:
-        system, user, selected, reference_chars, prompt_chars = (
-            self._render_bounded_prompt(source_text, target_text, existing)
-        )
-        try:
-            data = self._ask_strict_json(system, user)
-        except Exception as exc:
-            raise GlossaryExtractionError("model_or_json_error") from exc
-
-        if not isinstance(data, dict):
-            raise GlossaryExtractionError("response_not_object")
-        if "terms" not in data:
-            raise GlossaryExtractionError("terms_missing")
-        if set(data) != {"terms"}:
-            raise GlossaryExtractionError("response_extra_keys")
-        raw = data["terms"]
-        if not isinstance(raw, list):
-            raise GlossaryExtractionError("terms_not_list")
-
-        terms: list[GlossaryTerm] = []
-        normalized = 0
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            term = GlossaryTerm.from_mapping(item, confidence="medium")
-            if term is None:
-                continue
-            normalized += int(_was_normalized(item, term))
-            terms.append(term)
-
-        return _ParsedTerms(
-            terms=terms,
-            stats={
-                "received": len(raw),
-                "accepted": len(terms),
-                "rejected": len(raw) - len(terms),
-                "normalized": normalized,
-                "reference_terms_total": (
-                    len(existing) if reference_total is None else reference_total
-                ),
-                "reference_terms_relevant": len(existing),
-                "reference_terms_selected": len(selected),
-                "reference_terms_dropped": len(existing) - len(selected),
-                "reference_chars": reference_chars,
-                "prompt_chars": prompt_chars,
-            },
-        )
+        return [
+            term
+            for term in terms
+            if self._recurrence_cache[(term.source, term.type, tuple(term.aliases))]
+        ]
 
     def extract(
-        self,
-        source_text: str,
-        target_text: str,
-        existing: list[GlossaryTerm],
+        self, source_text: str, target_text: str, existing: list[GlossaryTerm]
     ) -> list[GlossaryTerm]:
-        """抽取并清洗术语；保留原有 list 返回契约供独立调用。"""
-        return self._extract_with_stats(source_text, target_text, existing).terms
+        """Extract valid terms from source/target pairs and normalize model field types."""
+        system = render("glossary_extractor_system", src=self.src, tgt=self.tgt)
+        user = render(
+            "glossary_extractor_user",
+            src=self.src,
+            tgt=self.tgt,
+            glossary=prompts.render_glossary(existing),
+            source=source_text,
+            target=target_text,
+        )
+        raw = self._ask_json(system, user, operation="glossary.extract", key="terms", default=[])
+        terms: list[GlossaryTerm] = []
+        for d in self.dict_items(raw):
+            source = _text(d.get("source"))
+            target = _text(d.get("target"))
+            if not source or not target:
+                continue
+            raw_aliases = d.get("aliases")
+            aliases = raw_aliases if isinstance(raw_aliases, list) else []
+            gender = _text(d.get("gender"))
+            terms.append(
+                GlossaryTerm(
+                    source=source,
+                    target=target,
+                    reading=_text(d.get("reading")),
+                    type=_text(d.get("type"), TYPE_TERM),
+                    gender=gender,
+                    aliases=[alias for a in aliases if (alias := _text(a))],
+                    note=_text(d.get("note")),
+                )
+            )
+        return terms
+
+    @staticmethod
+    def _first_occurrences(
+        terms: list[GlossaryTerm],
+        store: GlossaryStore,
+        history: Iterable[TranslatedSegmentEvidence],
+        before: tuple[int, int],
+    ) -> dict[str, TranslatedSegmentEvidence]:
+        """Find the first translated paragraph before the given position for terms not yet
+        stored.
+        """
+        pending = {term.source for term in terms if store.get_term(term.source) is None}
+        if not pending:
+            return {}
+
+        first: dict[str, TranslatedSegmentEvidence] = {}
+        ordered_history = sorted(history, key=lambda item: (item.chapter, item.segment))
+        for evidence in ordered_history:
+            if (evidence.chapter, evidence.segment) >= before:
+                continue
+            for source in pending:
+                if source in first:
+                    continue
+                if source_matches_text(source, evidence.source):
+                    first[source] = evidence
+            if len(first) == len(pending):
+                break
+        return first
+
+    def _align_with_first_occurrences(
+        self,
+        terms: list[GlossaryTerm],
+        occurrences: dict[str, TranslatedSegmentEvidence],
+    ) -> tuple[list[GlossaryTerm], int, int]:
+        """Align candidates with their first translations; defer terms whose historical mapping
+        is uncertain.
+        """
+        if not occurrences:
+            return terms, 0, 0
+
+        candidates = []
+        for term in terms:
+            evidence = occurrences.get(term.source)
+            if evidence is None:
+                continue
+            candidates.append(
+                {
+                    "source": term.source,
+                    "proposed_target": term.target,
+                    "first_occurrence": {
+                        "chapter": evidence.chapter,
+                        "segment": evidence.segment,
+                        "source": evidence.source,
+                        "target": evidence.target,
+                    },
+                }
+            )
+
+        system = render("glossary_history_system", src=self.src, tgt=self.tgt)
+        user = render(
+            "glossary_history_user",
+            src=self.src,
+            tgt=self.tgt,
+            candidates_json=json.dumps(candidates, ensure_ascii=False, indent=2),
+        )
+        raw = self._ask_json(
+            system, user, operation="glossary.align_history", key="terms", default=[]
+        )
+        resolved = {
+            source: target
+            for item in self.dict_items(raw)
+            if (source := _text(item.get("source"))) in occurrences
+            and (target := _text(item.get("target")))
+        }
+
+        aligned: list[GlossaryTerm] = []
+        unresolved = 0
+        for term in terms:
+            if term.source not in occurrences:
+                aligned.append(term)
+                continue
+            target = resolved.get(term.source)
+            if not target:
+                unresolved += 1
+                continue
+            aligned.append(replace(term, target=target))
+        return aligned, len(resolved), unresolved
 
     def extract_and_store(
         self,
@@ -194,37 +214,42 @@ class GlossaryExtractor(Agent):
         target_text: str,
         chapter: int,
         *,
-        checkpoint: GlossaryCheckpoint | None = None,
+        history: Iterable[TranslatedSegmentEvidence] = (),
+        before: tuple[int, int] | None = None,
+        source_corpus: str | None = None,
     ) -> dict[str, int]:
-        """抽取相关术语，并把本次写入与可选检查点原子提交。"""
-        empty_counts = {
+        """Extract and store terms, preferring the translation at their first historical
+        occurrence.
+        history contains translated evidence only. If a new term appears before the supplied
+        position, align target against its first source/target pair. Defer uncertain
+        mappings instead of locking a later candidate into the glossary and contaminating
+        subsequent text.
+        With source_corpus, inject only existing terms occurring at least twice in the
+        source. Low-frequency terms remain stored but do not repeatedly consume extraction
+        context.
+        """
+        all_existing = store.all_terms()
+        existing = (
+            self._recurring_existing_terms(all_existing, source_corpus)
+            if source_corpus is not None
+            else all_existing
+        )
+        terms = self.extract(source_text, target_text, existing)
+        occurrences = (
+            self._first_occurrences(terms, store, history, before) if before is not None else {}
+        )
+        terms, aligned, unresolved = self._align_with_first_occurrences(terms, occurrences)
+        summary = {
             "inserted": 0,
-            "updated": 0,
             "conflict": 0,
             "unchanged": 0,
+            "history_matched": len(occurrences),
+            "history_aligned": aligned,
+            "history_unresolved": unresolved,
         }
-        try:
-            all_terms = store.all_terms()
-            existing = GlossaryStore.terms_in(all_terms, source_text)
-        except Exception as exc:
-            raise GlossaryPersistenceError(empty_counts.copy()) from exc
-
-        parsed = self._extract_with_stats(
-            source_text,
-            target_text,
-            existing,
-            reference_total=len(all_terms),
-        )
-        if parsed.stats["rejected"]:
-            raise GlossaryExtractionError("terms_rejected")
-        summary = {**empty_counts, **parsed.stats}
-        try:
-            counts = store.upsert_terms(
-                parsed.terms,
-                chapter=chapter,
-                checkpoint=checkpoint,
-            )
-        except Exception as exc:
-            raise GlossaryPersistenceError(summary) from exc
-        summary.update(counts)
+        for t in terms:
+            evidence = occurrences.get(t.source)
+            t.first_chapter = evidence.chapter if evidence is not None else chapter
+            result = store.upsert_term(t, chapter=chapter)
+            summary[result] = summary.get(result, 0) + 1
         return summary

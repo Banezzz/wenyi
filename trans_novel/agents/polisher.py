@@ -1,35 +1,42 @@
-"""润色 Agent（强档）。
-
-在审校通过的直译稿上做中文文学性二次加工：不增删信息、保持段数不变。
-对齐失败（段数不符）时保守地返回原译文，绝不因润色而引入漏译。
+"""Polishing agent using the strong tier.
+Improve literary quality in the target language without changing information or paragraph
+count. Preserve the original translation on alignment failure so polishing cannot drop
+paragraphs.
 """
 
 from __future__ import annotations
 
 from ..glossary.store import GlossaryTerm
+from ..i18n.prompts import render
 from . import prompts
 from .base import Agent
 
 
 class Polisher(Agent):
-    def polish(self, targets: list[str], *, glossary_terms: list[GlossaryTerm] | None = None,
-               style: str = "") -> list[str]:
+    def polish(
+        self,
+        targets: list[str],
+        *,
+        glossary_terms: list[GlossaryTerm] | None = None,
+        style: str = "",
+    ) -> list[str]:
+        """Polish an aligned list; return the input unchanged on call or length failure."""
         if not targets:
             return []
         n = len(targets)
-        system = prompts.render("polisher_system", src=self.src, tgt=self.tgt, n=n)
-        user = prompts.render(
-            "polisher_user", src=self.src, tgt=self.tgt,
+        system = render("polisher_system", src=self.src, tgt=self.tgt, n=n)
+        user = render(
+            "polisher_user",
+            src=self.src,
+            tgt=self.tgt,
             glossary=prompts.render_glossary(glossary_terms or []),
-            style=style or "（无）", n=n,
+            style=style or "(none)",
+            n=n,
             numbered_target=prompts.numbered(targets),
         )
-        items = self._ask_json(system, user, tier="strong", key="polished", default=None)
+        items = self._ask_json(system, user, operation="polish.body", key="polished", default=None)
         if isinstance(items, list) and len(items) == n:
-            return [
-                candidate
-                if isinstance(candidate, str) and candidate.strip()
-                else original
-                for original, candidate in zip(targets, items)
-            ]
-        return list(targets)  # 失败/段数不符 → 保守保留原译
+            return [str(x) for x in items]
+        return list(
+            targets
+        )  # Preserve the original translation on failure or paragraph-count mismatch.

@@ -1,8 +1,7 @@
-"""Agent 基类：统一 client/config/src/tgt 初始化，与带默认值的 LLM 调用帮助方法。
-
-各 agent 的"渲染 system/user → complete_json → 失败回退默认值"模式收敛到这里；
-默认值语义留在 agent 层（传输层 llm/base.py 不掺业务回退）。
-orchestrator._apply_language 依赖每个 agent 都有 .src 属性——基类把该契约显式化。
+"""Shared agent initialization and LLM helpers with optional fallback values.
+Centralize the render-system/user, complete_json and fallback pattern. Business fallback
+semantics belong here, not in the LLM transport layer. Every agent exposes .src for language
+propagation by the pipeline.
 """
 
 from __future__ import annotations
@@ -12,29 +11,43 @@ from typing import Any
 from ..config import Config
 from ..llm.base import LLMClient
 
-_RAISE = object()  # 哨兵：未提供 default 时异常照常抛出，由调用方自理
+_RAISE = object()  # Sentinel: propagate exceptions when the caller supplies no default.
 
 
 class Agent:
     def __init__(self, client: LLMClient, config: Config):
+        """Store the shared client and config and cache the current source and target
+        languages.
+        """
         self.client = client
         self.config = config
         self.src = config.source_lang
         self.tgt = config.target_lang
 
-    def _ask_json(self, system: str, user: str, *, tier: str,
-                  key: str | None = None, default: Any = _RAISE,
-                  max_tokens: int | None = None) -> Any:
-        """system/user → complete_json。
-
-        异常时返回 default（未给 default 则照常抛出，如 Translator 交由重试逻辑处理）。
-        key 给出时：结果为 dict 取 data[key]（缺失回退）；结果为非空 list 直接用；否则回退。
+    def _ask_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        operation: str,
+        key: str | None = None,
+        default: Any = _RAISE,
+        max_tokens: int | None = None,
+    ) -> Any:
+        """Send system/user messages through complete_json.
+        Return default on failure, or propagate when no default is supplied (for example,
+        Translator handles alignment retries). With key, use data[key] for dictionaries, a
+        nonempty list directly, or the fallback otherwise.
         """
         try:
             data = self.client.complete_json(
-                [{"role": "system", "content": system},
-                 {"role": "user", "content": user}], tier=tier,
-                max_tokens=max_tokens)
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                operation=operation,
+                max_tokens=max_tokens,
+            )
         except Exception:
             if default is _RAISE:
                 raise
@@ -46,20 +59,32 @@ class Agent:
             return data.get(key, fb)
         return data if data else fb
 
-    def _ask_text(self, system: str, user: str, *, tier: str,
-                  default: str = "", max_tokens: int | None = None) -> str:
-        """complete 纯文本并 strip；异常返回 default。"""
+    def _ask_text(
+        self,
+        system: str,
+        user: str,
+        *,
+        operation: str,
+        default: str = "",
+        max_tokens: int | None = None,
+    ) -> str:
+        """Complete plain text and strip whitespace; return default on failure."""
         try:
-            return (self.client.complete(
-                [{"role": "system", "content": system},
-                 {"role": "user", "content": user}], tier=tier,
-                max_tokens=max_tokens) or "").strip()
-        except Exception:
+            return (
+                self.client.complete(
+                    [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    operation=operation,
+                    max_tokens=max_tokens,
+                )
+                or ""
+            ).strip()
+        except Exception:  # noqa: BLE001 - Text helper calls return the configured fallback on failure.
             return default
 
     @staticmethod
     def dict_items(items: Any) -> list[dict]:
-        """过滤出 dict 元素（issues/terms 等模型返回列表的通用清洗）。"""
-        if not isinstance(items, list):
-            return []
-        return [i for i in items if isinstance(i, dict)]
+        """Keep dictionary items from model collections such as issues and terms."""
+        return [i for i in items or [] if isinstance(i, dict)]

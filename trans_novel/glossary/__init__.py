@@ -1,4 +1,4 @@
-"""专有名词对照表（术语库）+ 翻译记忆库。"""
+"""Glossary mappings and translation-conflict records."""
 
 from .store import GlossaryStore, GlossaryTerm
 

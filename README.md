@@ -1,203 +1,275 @@
-# 文译
+<div align="center">
 
-专注于将多语言 EPUB、FB2 或 TXT 小说翻译成中文，并尽量保留 EPUB 原排版、图片、目录和跳转。
+<h1>
+  <img src="docs/images/wenyi-emblem.png" alt="" width="280">
+  <br>
+  <img src="docs/images/wenyi-wordmark-en.svg" alt="Wenyi" width="180" height="54">
+</h1>
 
-项目的日常入口只有一个命令：`translate`。它会完成预扫、分析、翻译、可选润色、章末审校、标点规范化和 EPUB 导出；中断后可以继续跑。
+**Carry stories across languages.**
 
-## 快速开始
+Translation for books and long-form writing, with the whole work in view.
+
+Whole-book understanding · Consistent terminology · Evidence-based review
+
+[![Python](https://img.shields.io/badge/python-3.10%2B-D4B56A?style=flat-square&labelColor=00263D)](https://www.python.org/)
+[![Tests](https://img.shields.io/github/actions/workflow/status/BigDawnGhost/wenyi/tests.yml?style=flat-square&labelColor=00263D)](https://github.com/BigDawnGhost/wenyi/actions/workflows/tests.yml)
+[![License](https://img.shields.io/badge/license-MIT-D4B56A?style=flat-square&labelColor=00263D)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/BigDawnGhost/wenyi?style=flat-square&labelColor=00263D&color=D4B56A)](https://github.com/BigDawnGhost/wenyi/stargazers)
+[![Discord](https://img.shields.io/badge/Discord-join-D4B56A?style=flat-square&labelColor=00263D&logo=discord&logoColor=white)](https://discord.gg/sM3AQcF5D2)
+
+[Quick start](#quick-start) · [Language support](docs/usage.md#multilingual-translation-experimental) · [Documentation](#documentation)
+
+**English** | [简体中文](docs/zh/README.md)
+
+<a href="https://hellogithub.com/repository/BigDawnGhost/wenyi" target="_blank"><img src="https://abroad.hellogithub.com/v1/widgets/recommend.svg?rid=648c0ab0997c42479027e360f604fa23&claim_uid=EkLpt1FHIqRrade&theme=small" alt="Featured｜HelloGitHub" /></a>
+
+</div>
+
+---
+
+## Table of contents
+
+- [Why Wenyi](#why-wenyi)
+- [Core features](#core-features)
+- [Quick start](#quick-start)
+- [Supported formats](#supported-formats)
+- [Translation pipeline](#translation-pipeline)
+- [Documentation](#documentation)
+- [Limitations](#limitations)
+- [Community](#community)
+- [Star history](#star-history)
+- [License](#license)
+
+---
+
+## Why Wenyi
+
+| Typical approach | Wenyi |
+|---|---|
+| Segments translated in isolation, unaware of surrounding content | Whole-book prescan with chapter digests and rolling context |
+| Glossary managed manually or as an afterthought | Real-time term extraction with conflict detection, fed back into subsequent batches |
+| Single-pass translation, fragile to interruptions | Batch checkpoints and chapter status tracking: resume any interrupted run with the same command |
+| Raw model output, no systematic quality process | Translate → polish → evidence-driven whole-book review |
+
+Wenyi is designed for **long-form texts** — novels, social-science monographs, narrative nonfiction, and more.
+
+<p align="center">
+  <img src="docs/images/bilingual-preview.png" alt="Wenyi bilingual EPUB preview" width="720">
+  <br>
+  <sub>A bilingual reading sample: translation alongside visually subdued source text.</sub>
+</p>
+
+---
+
+## Core features
+
+- **Whole-book understanding** — prescans the source before translation, creating per-chapter digests and a book-level synopsis injected into every batch
+- **Real-time glossary** — extracts proper names, terms, and recurring expressions as translation progresses; detects conflicting translations and surfaces them for resolution
+- **Multi-stage quality** — optional polishing (strong model) and an evidence-driven whole-book AI review
+- **Resumability** — batch-level checkpoints, chapter status tracking, and atomic state writes; interrupt at any point and resume with the same command
+- **Multiple LLM providers** — DeepSeek, OpenAI, OpenRouter, OrcaRouter, Google Gemini, Ollama, vLLM, and generic OpenAI-compatible endpoints; keep three convenient tiers or select models per operation, mix connections, and share request limits. See [model routing](docs/configuration.md#models-and-operation-routing).
+- **Native EPUB preservation** — writes translated text back into the original XHTML templates and attempts to preserve styles, images, TOC, and anchors
+- **Bilingual output** — optional source-and-translation edition with visually subdued source text, including dark mode support
+
+---
+
+## Quick start
+
+### Prerequisites
+
+Wenyi requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+
+### Installation
 
 ```bash
+git clone https://github.com/BigDawnGhost/wenyi.git
+cd wenyi
 uv sync
-export LONGCAT_API_KEY='<your-key>'
+```
+
+### Configuration
+
+Set your API key:
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+```
+
+### One-command translation
+
+```bash
 uv run trans-novel translate book.epub
 ```
 
-翻译完成后，默认会在源文件目录下生成译文 EPUB。运行状态、章节 JSON、术语库和报告会放在 `state/` 目录下。
+This parses the book, detects the source language, prescans for understanding, translates all chapters, and assembles the output. The monolingual Chinese EPUB is written to `output/book.zh.epub` by default.
 
-中断后继续：
+Multilingual translation (experimental): select a direction using `language.source` / `language.target`, such as `zh → en` or `en → ja`. Run `uv run trans-novel languages` for the list. Targets have separate state and output names. See the [usage guide](docs/usage.md#multilingual-translation-experimental).
 
-```bash
-uv run trans-novel resume book.epub --polish --qa
-```
-
-`translate` 本身也有同样的续跑语义；`resume` 只是更明确的入口。程序会复用
-`state/<book-slug>/`，只请求仍缺译文的连续段区间。已经落盘的译文不会因为术语抽取失败
-而重翻；若译文已经完整但术语 checkpoint 尚未完成，续跑只补术语阶段。
-`resume` 支持与 `translate` 相同的 `--format`、`--out`、`--polish/--no-polish` 和
-`--qa/--no-qa` 覆盖项。命令行覆盖不会改写 `config.yaml`，因此依赖覆盖项的长任务在续跑时
-应再次给出相同开关。
-
-已有 run 的 manifest 会绑定 `glossary.db` 的 generation ID。数据库缺失、被另一份数据库
-替换，或 manifest 丢失但目录仍有残留产物时，命令会失败关闭，不会静默创建/复用空库并
-误报完成。
-
-同一本书的同一 `state/<book-slug>/` 同一时间只允许一个 `translate` 或 `resume`
-进程写入。备份、恢复和迁移状态前也应先停止该 writer；操作步骤见
-[开发文档的状态备份与恢复](docs/dev.md#状态备份与恢复)。
-
-查看进度：
+### Step-by-step workflow
 
 ```bash
+# 1. Prepare — parse, analyze, prescan (no body text translated)
+uv run trans-novel prepare book.epub
+
+# 2. Translate — resume from the prepared state
+uv run trans-novel translate book.epub
+
+# 3. Review — independent final review against the completed glossary
+uv run trans-novel review book.epub
+
+# 4. Check progress
 uv run trans-novel status book.epub
 ```
 
-仅重新导出 EPUB：
+### Interrupt and resume
 
-```bash
-uv run trans-novel tools assemble book.epub
-```
-
-## 输入和输出
-
-- 输入：EPUB、FB2、TXT。
-- 默认输出：中文 EPUB。
-- EPUB 输入会按原 XHTML 模板回填译文，尽量保留原书样式、图片、目录和锚点。
-- TXT 输入会生成新的 EPUB。
-- 需要纯文本时使用 `--format txt`。
-
-示例：
+Every completed batch is persisted immediately. If a run is interrupted, execute the same command again:
 
 ```bash
 uv run trans-novel translate book.epub
-uv run trans-novel translate book.epub --format txt
-uv run trans-novel translate book.epub --chapter 3
 ```
 
-## 常用开关
+### Command-line overrides
 
 ```bash
-uv run trans-novel translate book.epub --polish
-uv run trans-novel translate book.epub --no-polish
-uv run trans-novel translate book.epub --qa
-uv run trans-novel translate book.epub --no-qa
+uv run trans-novel translate book.epub --polish --review          # enable polishing and final review
+uv run trans-novel translate book.epub --no-polish                # disable polishing
+uv run trans-novel translate book.epub --no-review                # skip final review
+uv run trans-novel translate book.epub --bilingual                # produce both editions
+uv run trans-novel translate book.epub --chapter 0                # translate the first chapter (indices start at 0)
+uv run trans-novel translate book.epub --format txt               # export as plain text
 ```
 
-`--polish/--no-polish` 会覆盖 `config.yaml` 里的 `pipeline.polish`。当前仓库的 `config.yaml` 写的是 `polish: true`，所以不加参数时默认会润色；代码层面的缺省值是 `false`，只在配置文件没写该字段时生效。
-
-润色会让每个翻译批次多一次 `strong` 档 LLM 请求，质量可能更稳，但会明显增加耗时和成本。已经翻译完成的批次会被断点续跑跳过，后来再开关润色不会自动重跑旧译文。
-
-## 配置
-
-主要配置都在 `config.yaml`：
-
-- `language.source`: `auto` 由模型识别源语言，也可以写死语言代码，如 `ja`、`en`、`ko`、`ru`、`de` 等。
-- `llm.tiers`: 配置 `strong`、`cheap`、`fast` 三档模型。
-- `pipeline.review`: 章末审校。
-- `pipeline.autofix_severe`: 对严重问题自动重译并采纳通过校验的结果。
-- `pipeline.polish`: 翻译后再做中文润色。
-- `pipeline.backtranslate_sample`: 回译抽检比例，`0` 为关闭。
-- `pipeline.consistency_qa`: 全书跨章一致性扫描。
-- `pipeline.book_understanding`: 翻译前预扫整本书，生成全书概览和逐章梗概。
-- `pipeline.rolling_context_segments`: 每批翻译时带入的前文译文段数。
-- `segment.max_chars_per_batch`: 每个翻译批次的大小。
-- `segment.max_chars_per_segment`: 超长段落的拆分阈值。
-
-离线测试或调试流程时，可以把 `llm.provider` 改成 `fake`，不会发网络请求。
-
-## 工作流程
-
-默认连续流程大致是：
-
-```text
-读取输入
-→ 解析章节、正文段落和 EPUB 目录
-→ 模型识别源语言（或使用配置指定语言）
-→ 预扫整本书，生成全书概览和逐章梗概
-→ 分析样章，建立初始术语表
-→ 按章、按批翻译
-→ 可选润色
-→ 标点规范化
-→ 章末 review
-→ 可选严重项自动重译
-→ 可选一致性 QA
-→ 回填导出 EPUB/TXT
-```
-
-每个批次翻译完成后都会写入 `state/`，所以长书中断后可以续跑。已经有译文的批次会跳过，只补未完成部分。
-
-## 一致性机制
-
-- **术语库**：人名、地名、专有名词和敬称会进入 SQLite 术语库，翻译时按配置注入提示词。
-- **全书理解**：翻译前预扫源文，生成全书概览和章节梗概，让早期章节也能参考全书走向。
-- **滚动上下文**：章内批次串行处理，后一个批次能看到前面最近几段译文。
-- **段数对齐**：每批输入 N 段，要求模型输出 N 段 JSON；段数不符会重试，仍失败则逐段兜底。
-- **章末 review**：按章检查漏译、误译、术语、人称等问题；默认只记录问题，是否自动修复由 `autofix_severe` 控制。
-- **回译抽检**：从章末最终译文按稳定指纹确定性抽样；续跑会从已保存 target 重建同一抽样，自动修订后的译文也是回译输入。
-- **标点规范化**：译文统一为简体中文大陆常用全角标点。
-
-## 常用工具
+Final review runs by default after the complete book has been translated and the
+glossary has reached its final state. Pass `--no-review` or set
+`pipeline.review: false` to skip it. You can also run Agent Review independently:
 
 ```bash
-uv run trans-novel tools glossary book.epub list
-uv run trans-novel tools glossary book.epub conflicts
-uv run trans-novel tools qa book.epub
-uv run trans-novel tools report book.epub
-uv run trans-novel tools assemble book.epub
+uv run trans-novel review book.epub
+uv run trans-novel review book.epub --autofix
 ```
 
-这些工具主要用于查看术语库、检查一致性、生成报告或重新导出成品。QA 和报告默认只汇总问题，不会自动改正文。
+Each Review run starts from the beginning, checks chunks concurrently, and can
+selectively request cross-book evidence before resolving contradictory
+consistency suggestions. Confirmed issues can produce provisional full-segment
+replacements in a run-local shadow translation. A fresh whole-book review sees
+the shadow text—but not the previous issue explanation—and validates it again.
+Review publishes to formal chapter `target` values by default. Pass
+`--no-autofix` or set `pipeline.review_autofix: false` to keep the run
+read-only. With Autofix, folded changes are applied first and remaining
+issues reuse the existing Review Agent Loop and Fixer against that updated text.
+Only formal segment `target` values are replaced; full history stays in the Review
+directory's `autofix/index.json`. The consolidated result, run usage, events, and
+internal records are written under `state/<book>/targets/<target-language>/reviews/review-<timestamp>/`.
 
-## 模型档位
+---
 
-仓库内的 `config.yaml` 默认使用 LongCat，通过 OpenAI SDK 调用
-`https://api.longcat.chat/openai/v1`，并从 `LONGCAT_API_KEY` 读取密钥。
-也可以把 `llm.provider`、`base_url` 和 `api_key_env` 改为 DeepSeek 对应配置。
+## Supported formats
 
-- `strong`: 翻译、润色、全局分析、标题翻译。
-- `cheap`: 章末 review、一致性 QA、回译比对。
-- `fast`: 全书预扫、章节梗概、术语抽取、回译等机械任务。
+| Input | Output |
+|---|---|
+| EPUB, FB2, TXT, Markdown, HTML, PDF, DOCX | EPUB (monolingual / bilingual), TXT, HTML, Markdown, DOCX |
+| SRT (movie / series subtitles) | `.zh.srt` (monolingual) and optional `.zh-bi.srt` (bilingual) |
 
-默认 `strong` 和 `cheap` 都开启 thinking 且保持 `reasoning_effort: high`；`fast` 为机械任务
-关闭 thinking。若模型 ID 变化，直接改 `config.yaml` 里的 `llm.tiers`。
+- PDF input defaults to MinerU and requires `MINERU_API_KEY` for the initial conversion; the resulting HTML is cached and reused. The BabelDOC bridge is optional for layout-preserving PDFs.
+- EPUB output attempts to preserve the original book's styles, images, table of contents, and anchors. Vertical layout is converted to horizontal for Chinese reading.
+- Source language is auto-detected by default, or fixed to an ISO 639-1 code in `config.yaml`.
+- `.srt` input is auto-detected by `translate`. It uses a light concurrent path (no glossary, polish, or whole-book review). State lives under `state/srt/<slug>/targets/<target-language>/`; outputs default to the source file's `output/` directory. Details: [Usage guide](docs/usage.md#srt-subtitles).
+- `.docx` input uses the full book pipeline. Headings, simple tables, lists, and common run/paragraph styles are preserved where possible; translated Chinese uses Song (宋体). Default export is `.zh.docx` (override with `--format`). Details: [Usage guide](docs/usage.md#docx-word).
 
-## 开发文档
+---
 
-- [设计与恢复手册](docs/dev.md)：模块边界、术语 checkpoint、续跑与状态备份/恢复。
-- [状态与调用契约](docs/api.md)：CLI、运行目录、manifest、事件和 SQLite 边界。
-- [变更记录](docs/progress.md)：可感知的功能、修复及验证方式。
-- [未解决审计项](docs/audits.md)：当前仍需处理的正确性或运维限制。
+## Translation pipeline
 
-## 项目结构
+```mermaid
+flowchart TD
+    A[Input file] --> B[Parse chapters and detect language]
+    B --> C[Analyze style and seed the glossary]
+    C --> D[Optional parallel prescan<br/>Chapter digests and book synopsis]
+    D --> E
 
-```text
-trans_novel/
-  ingest/       输入解析、EPUB/FB2/TXT 切分
-  llm/          LLM 抽象接口、LongCat/DeepSeek provider、FakeClient
-  glossary/     SQLite 术语库、抽取、冲突处理
-  agents/       分析、翻译、审校、润色、一致性、提示词
-  pipeline/     编排器、断点状态、滚动上下文、校验
-  postprocess/  标点规范化
-  assemble/     EPUB/TXT 回填导出、QA 报告
-tests/          离线测试
-docs/           设计、状态契约、进度和未解决审计项
+    subgraph T[Translate chapter by chapter]
+        E[Inject context and translate a batch]
+        E --> F[Polish and persist translations]
+        F --> FA[Immediately align annotated EPUB paragraphs<br/>Sequential; skipped when disabled or absent]
+        FA --> G[Extract terms and refresh the glossary]
+        G --> H{More batches?}
+        H -- Yes --> E
+        H -- No --> IB[Run chapter-level fallback term extraction]
+        IB --> J[Persist the final chapter]
+    end
+
+    J --> K[Optional parallel whole-book review<br/>Using the completed glossary]
+    K --> N{Confirmed issues and<br/>Fix budget remaining?}
+    N -- Yes --> O[Generate provisional shadow fixes<br/>From one immutable snapshot]
+    O --> K
+    N -- No or stopped --> P[Save Review issues<br/>and folded changes]
+    P --> Q{Autofix enabled?}
+    Q -- Yes --> R[Overlay changes; reuse Agent Loop and Fixer<br/>Publish final segment targets]
+    Q -- No --> X[Optionally normalize punctuation<br/>on the export-only copy]
+    R --> X
+    X --> M[Generate the report and assemble the selected output]
 ```
 
-## 测试
+When enabled, the prescan runs in parallel with configurable concurrency and is idempotent — completed digests are reused across runs. During translation, each batch receives the most recent glossary snapshot and translated context, keeping pronouns, terms, and tone consistent across chapters.
+The Review Fixer receives the same style brief, book synopsis, chapter digest,
+relevant glossary subset, and nearby source/translation context used to preserve
+the book's voice. Its normal Review-loop replacements remain temporary; the
+optional Autofix publisher can later reuse it to produce formal segment targets.
 
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python -m unittest discover -s tests
-```
+---
 
-如果本机 `uv` 缓存目录可写，也可以直接运行：
+## Documentation
 
-```bash
-uv run python -m unittest discover -s tests
-```
+- [Usage guide](docs/usage.md) — installation, Windows setup, input/output, resumability, independent stages
+- [Configuration](docs/configuration.md) — providers, languages, pipeline switches, segmentation, paths
+- [Translation pipeline](docs/pipeline.md) — whole-book analysis, terminology, context, polishing, review
+- [Contributing](CONTRIBUTING.md) — development, testing, and contribution guidelines
 
-## 贡献
+Translated state directories for public-domain books may be shared through [wenyi-bookcase](https://github.com/BigDawnGhost/wenyi-bookcase). Do not publish copyrighted text, private books, or `state/` directories containing sensitive information without permission.
 
-欢迎提交 bug 修复、格式兼容、测试样例和文档改进。开发说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+---
 
-## 憧憬与不足
+## Limitations
 
-本项目为作者个人兴趣所开发，仅在于针对长文本书籍的译介做出一份微薄的努力，未来想让翻译在够准确的前提下更加顺畅，努力从可读向好读迈进。现阶段翻译文本一些口头禅前后翻译不一致，专有名词翻译不准确的问题，已经改进！如果还有什么问题，可以提交issue，如果你有什么想法，欢迎在讨论区提出，如果你有一定的编程能力，欢迎给我提交PR，让这个项目变得更好。👏
+- Multilingual translation is experimental: Chinese, English, Japanese, Korean, French, German, Spanish, Italian, Portuguese, Russian, and selected variants have built-in profiles. Real-model long-form quality still needs evaluation; the CLI and prompt instructions use English, while generated descriptive metadata follows the translation target.
+- Polishing and final review are the most expensive stages. Shadow fixing may
+  trigger multiple full-book review passes and additional Fixer calls.
+- PDF input defaults to MinerU and requires an API key for the initial conversion. The BabelDOC bridge is optional for layout-preserving PDFs.
+- SRT translation is a light concurrent path: no glossary, polishing, or whole-book review, and slug collision is possible for identically named files in different folders.
+- Translation quality is bounded by the capabilities of the chosen LLM model.
+- Very long books may produce large state directories; storage requirements grow with book length.
 
-## 星标历史
+---
 
-<a href="https://www.star-history.com/?repos=BigDawnGhost%2FWenyi&type=date&legend=top-left">
+## Community
+
+- [Discord server](https://discord.gg/sM3AQcF5D2)
+- QQ group: 1055065098
+- [GitHub Issues](https://github.com/BigDawnGhost/wenyi/issues) — bug reports and feature requests
+- [GitHub Discussions](https://github.com/BigDawnGhost/wenyi/discussions) — ideas and questions
+
+---
+
+## Star history
+
+<a href="https://star-history.dera.page/#BigDawnGhost/wenyi&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=BigDawnGhost/Wenyi&type=date&theme=dark&legend=top-left&sealed_token=VFuKZdjDh-9e2mG4qlvqeSpCkWCoRf9ZRy0hIDLdaECFQeoNNlQ20QxSD4PuvTZp1RJg7J2s5hr57Eq66paMrhikuuI3kc41uZZCYb-bTqsUafeSB7AVdhw7bmz70NhkVXABHtSIHdw0DROZaInmznYJ651gP2klEeW8OOM8EkfJnXgDld6f0xn8mIJ9" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=BigDawnGhost/Wenyi&type=date&legend=top-left&sealed_token=VFuKZdjDh-9e2mG4qlvqeSpCkWCoRf9ZRy0hIDLdaECFQeoNNlQ20QxSD4PuvTZp1RJg7J2s5hr57Eq66paMrhikuuI3kc41uZZCYb-bTqsUafeSB7AVdhw7bmz70NhkVXABHtSIHdw0DROZaInmznYJ651gP2klEeW8OOM8EkfJnXgDld6f0xn8mIJ9" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=BigDawnGhost/Wenyi&type=date&legend=top-left&sealed_token=VFuKZdjDh-9e2mG4qlvqeSpCkWCoRf9ZRy0hIDLdaECFQeoNNlQ20QxSD4PuvTZp1RJg7J2s5hr57Eq66paMrhikuuI3kc41uZZCYb-bTqsUafeSB7AVdhw7bmz70NhkVXABHtSIHdw0DROZaInmznYJ651gP2klEeW8OOM8EkfJnXgDld6f0xn8mIJ9" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=BigDawnGhost/wenyi&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=BigDawnGhost/wenyi&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=BigDawnGhost/wenyi&type=date&legend=top-left" />
  </picture>
 </a>
+
+---
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+## AtomGit (China)
+
+Wenyi is also hosted on AtomGit: [https://atomgit.com/BigDawnGhost/wenyi](https://atomgit.com/BigDawnGhost/wenyi)

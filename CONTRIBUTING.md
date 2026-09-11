@@ -1,15 +1,19 @@
-# 贡献指南
+# Contributing to Wenyi
 
-感谢你愿意让这个项目变得更好。本项目优先关注长篇小说翻译质量。
+**English** | [简体中文](docs/zh/CONTRIBUTING.md)
 
-## 可以贡献什么
+Thank you for helping improve Wenyi. The project prioritizes the quality and reliability of long-form novel translation.
 
-欢迎提交：
+## What you can contribute
 
-- 输入解析：EPUB、FB2、TXT 等格式兼容性扩展与改进。
-- 翻译流程：上下文、术语表、审校、润色、一致性检查。
-- 导出：EPUB输出、目录、元数据、排版保留。
-- 测试：真实失败样例、回归测试、离线 fake LLM 测试。
-- 文档：使用说明、配置解释、常见问题。
+Contributions are welcome in the following areas:
 
-注意，如果涉及核心翻译流程，即对翻译质量可能有影响的，请先测试一本不少于五万字的公版小说，提供修改前后版本对比分析，证明确实可以改进翻译质量。
+- Input parsing: compatibility improvements and new support for EPUB, FB2, TXT, DOCX, SRT, and related formats.
+- Translation pipeline: context handling, terminology, review, polishing, and consistency checks. Subtitle work belongs in `trans_novel.srt`, not the book Orchestrator.
+- Export: EPUB/DOCX output, tables of contents, metadata, layout preservation, and SRT writers.
+- Tests: real-world failure cases, regression tests, and offline fake-LLM tests.
+- Documentation: usage instructions, configuration explanations, troubleshooting, and translations.
+
+Changes to the core translation pipeline can affect translation quality in subtle ways. Before proposing such a change, test it on a public-domain novel of at least 50,000 words and include a before-and-after comparison that explains the quality impact.
+
+Use standard English for code comments, docstrings, configuration comments, CLI messages, and prompt instructions. Keep language rules and task templates in `trans_novel/i18n/data/`. Generated prose, including glossary notes and analysis descriptions, follows the translation target; original `source` and `aliases` remain unchanged for matching. Preserve language-specific examples and multilingual test fixtures, and keep English and Chinese documentation synchronized.

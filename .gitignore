@@ -2,15 +2,26 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+build/
+dist/
+*.spec
 state/
 *.db
 .DS_Store
 *.zh.epub
 *.zh.txt
 *.txt
+!trans_novel/i18n/data/tasks/*.txt
+!trans_novel/i18n/data/shared/*.txt
 
-# 输入书籍 / 生成产物（勿入库）
+# Input books and generated artifacts (do not commit)
+output/
+explore/
 *.epub
 *.fb2
 *.mobi
 *.azw3
+*.pdf
+*.html
+*.srt
+*.docx

@@ -1,13 +1,10 @@
-"""译文标点规范化 —— 统一为简体中文大陆通用全角标点。
-
-确定性兜底（提示词已要求，这里再保一道）：
-- 日式引号 「」→ “”，『』→ ‘’；
-- 英式直引号 "→ “/”（按出现次序配对），' → ‘/’（按次序配对，撇号尽量保留）；
-- 半角 , . ! ? : ; 在中文语境（相邻为 CJK）→ 全角 ，。！？：；；
-- 连续点号 ... / 。。。 / ・・・ → ……；-- 或 — → ——。
-
-策略保守：英文/数字串内部的半角标点（如 9.11、Mr. Smith）不误伤——
-仅当半角标点紧邻 CJK 字符时才转全角。
+"""Normalize export-copy punctuation to mainland Simplified Chinese conventions.
+Convert Japanese and straight ASCII quotes to paired curly forms while preserving
+apostrophes. Convert half-width sentence punctuation adjacent to CJK into full-width forms.
+Normalize ellipses and dashes to Chinese doubled forms.
+Be conservative around English and numbers: preserve internal punctuation in examples such
+as 9.11 and Mr. Smith. These deterministic transformations affect only disposable export
+copies, never formal state.
 """
 
 from __future__ import annotations
@@ -15,77 +12,139 @@ from __future__ import annotations
 import re
 
 _CJK = (
-    "一-鿿"      # CJK 统一汉字
-    "぀-ヿ"      # 假名（保险）
-    "＀-￯"      # 全角符号
+    "一-鿿"  # CJK unified ideographs.
+    "぀-ヿ"  # Kana, included conservatively.
+    "＀-￯"  # Full-width symbols.
     "“”‘’（）《》【】、，。！？：；…—"
 )
 _CJK_RE = f"[{_CJK}]"
 
-# 半角标点 → 全角
+# Half-width to full-width punctuation.
 _HALF_TO_FULL = {",": "，", ".": "。", "!": "！", "?": "？", ":": "：", ";": "；"}
 
 
-def _convert_quotes(text: str) -> str:
-    # 日式引号直接映射
+def _convert_quotes(
+    text: str,
+    *,
+    double_open: bool = True,
+    single_open: bool = True,
+) -> tuple[str, bool, bool]:
+    """Convert Japanese/ASCII quotes and return updated single/double-quote state."""
+    # Map Japanese quotation marks directly.
     text = text.translate(str.maketrans({"「": "“", "」": "”", "『": "‘", "』": "’"}))
 
-    # 英式直双引号：按出现次序交替配对 → “ ”
+    # Alternate straight double quotes between opening and closing curly forms.
     out = []
-    open_dq = True
     for ch in text:
         if ch == '"':
-            out.append("“" if open_dq else "”")
-            open_dq = not open_dq
+            out.append("“" if double_open else "”")
+            double_open = not double_open
         else:
             out.append(ch)
     text = "".join(out)
 
-    # 直单引号：仅当成对出现于引用语境时转弯引号；撇号（被字母包夹）保留为 ’
-    def _single(m: re.Match) -> str:
-        return "’"  # 英文撇号统一为右单引号字形
-    text = re.sub(r"(?<=[A-Za-z])'(?=[A-Za-z])", _single, text)
-    # 其余成对单引号交替配对
-    out, open_sq = [], True
-    for ch in text:
+    # Apostrophes within words do not change quote state. Trailing apostrophes and closing quotes
+    # both use the right-curly form, but only close quote state when already inside a quotation.
+    out = []
+    for index, ch in enumerate(text):
         if ch == "'":
-            out.append("‘" if open_sq else "’")
-            open_sq = not open_sq
+            before = text[index - 1] if index else ""
+            after = text[index + 1] if index + 1 < len(text) else ""
+            before_letter = before.isascii() and before.isalpha()
+            after_letter = after.isascii() and after.isalpha()
+            if before_letter and after_letter:
+                out.append("’")
+            elif before_letter and not single_open:
+                out.append("’")
+                single_open = True
+            elif before_letter:
+                out.append("’")
+            else:
+                out.append("‘" if single_open else "’")
+                single_open = not single_open
         else:
             out.append(ch)
-    return "".join(out)
+    return "".join(out), double_open, single_open
 
 
 def _convert_ellipsis_dash(text: str) -> str:
+    """Normalize ellipsis and dash variants to Chinese doubled forms."""
     text = re.sub(r"。{3,}", "……", text)
     text = re.sub(r"・{2,}", "……", text)
     text = re.sub(r"\.{3,}", "……", text)
-    text = re.sub(r"…+", "……", text)          # 单个/多个 … → ……
+    text = re.sub(r"…+", "……", text)  # Normalize one or more ellipsis symbols to the doubled form.
     text = re.sub(r"-{2,}", "——", text)
-    text = re.sub(r"—{1,}", "——", text)        # — / —— 归一为 ——
-    text = re.sub(r"——(——)+", "——", text)
+    text = re.sub(r"—{1,}", "——", text)  # Normalize em dashes to the doubled form.
     return text
 
 
 def _convert_halfwidth(text: str) -> str:
-    """半角 ,.!?:; 紧邻 CJK 时转全角。"""
+    """Convert half-width sentence punctuation adjacent to CJK into full-width forms."""
+
     def repl(m: re.Match) -> str:
+        """Replace matched half-width punctuation through the mapping table."""
         return _HALF_TO_FULL[m.group(0)]
 
-    # 标点左侧或右侧是 CJK 即转（避免误伤英文/数字内部）
-    pattern = re.compile(
-        rf"(?<={_CJK_RE})[,.!?:;]|[,.!?:;](?={_CJK_RE})"
+    # Convert when CJK is on the left. With CJK only on the right, preserve punctuation following
+    # ASCII letters/digits to avoid corrupting abbreviation or version boundaries next to CJK.
+    pattern = re.compile(rf"(?<={_CJK_RE})[,.!?:;]|[,.!?:;](?={_CJK_RE})")
+    return pattern.sub(
+        lambda match: (
+            match.group(0)
+            if match.start() > 0
+            and text[match.start() - 1].isascii()
+            and text[match.start() - 1].isalnum()
+            else repl(match)
+        ),
+        text,
     )
-    return pattern.sub(repl, text)
 
 
-def normalize_zh(text: str) -> str:
-    """把一段中文译文的标点规范化为简体中文通用全角标点。"""
+def _normalize_with_quote_state(
+    text: str,
+    *,
+    double_open: bool,
+    single_open: bool,
+) -> tuple[str, bool, bool]:
+    """Normalize one paragraph using the supplied quote state and return the new state."""
     if not text:
-        return text
-    text = _convert_quotes(text)
+        return text, double_open, single_open
+    text, double_open, single_open = _convert_quotes(
+        text,
+        double_open=double_open,
+        single_open=single_open,
+    )
     text = _convert_ellipsis_dash(text)
     text = _convert_halfwidth(text)
-    # 全角标点后的多余空格清理（中文标点后不留空格）
-    text = re.sub(r"([，。！？：；、”’》】])\s+", r"\1", text)
-    return text
+    text = re.sub(r"([，。！？：；、])\s+", r"\1", text)
+    text = re.sub(rf"([”’》】])\s+(?={_CJK_RE})", r"\1", text)
+    return text, double_open, single_open
+
+
+def normalize_zh_segments(
+    texts: list[str],
+    continuations: list[bool] | None = None,
+) -> list[str]:
+    """Normalize logical paragraphs, carrying quote state only across cont=True continuations.
+    Unbalanced quotes in an ordinary paragraph must not affect the next paragraph and cause
+    cascading changes.
+    """
+    if continuations is None:
+        continuations = [False] * len(texts)
+    if len(continuations) != len(texts):
+        raise ValueError("texts and continuations must have the same length")
+
+    normalized: list[str] = []
+    double_open = True
+    single_open = True
+    for index, (text, continuation) in enumerate(zip(texts, continuations)):
+        if index == 0 or not continuation:
+            double_open = True
+            single_open = True
+        value, double_open, single_open = _normalize_with_quote_state(
+            text,
+            double_open=double_open,
+            single_open=single_open,
+        )
+        normalized.append(value)
+    return normalized

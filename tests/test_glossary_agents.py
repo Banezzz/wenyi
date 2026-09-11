@@ -1,4 +1,4 @@
-"""分析器 / 术语抽取 / 滚动上下文 的测试（离线）。"""
+"""Offline analyzer, glossary-extraction and rolling-context tests."""
 
 from __future__ import annotations
 
@@ -7,40 +7,48 @@ import os
 import tempfile
 import unittest
 
-from trans_novel.config import Config
-from trans_novel.llm.base import FakeClient
-from trans_novel.glossary.store import (
-    GlossaryCheckpoint,
-    GlossaryStore,
-    GlossaryTerm,
-    TYPE_APPELLATION,
-)
-from trans_novel.glossary import extractor as extractor_module
-from trans_novel.glossary.extractor import (
-    GlossaryExtractionError,
-    GlossaryExtractor,
-)
 from trans_novel.agents.analyzer import Analyzer
-from trans_novel.agents import prompts
+from trans_novel.config import Config
+from trans_novel.glossary.extractor import (
+    GlossaryExtractor,
+    TranslatedSegmentEvidence,
+)
+from trans_novel.glossary.store import GlossaryStore, GlossaryTerm
+from trans_novel.llm.providers.fake import FakeClient
 from trans_novel.pipeline.context import RollingContext
 
 
 def _cfg():
-    return Config.from_dict({
-        "language": {"source": "ja", "target": "zh"},
-        "llm": {"provider": "fake", "tiers": {
-            "strong": {"model": "p"}, "cheap": {"model": "f"}}},
-    })
+    return Config.from_dict(
+        {
+            "language": {"source": "ja", "target": "zh"},
+            "llm": {
+                "preset": "fake",
+                "models": {
+                    "default_strong": {"provider": "default", "model": "p"},
+                    "default_cheap": {"provider": "default", "model": "f"},
+                },
+            },
+        }
+    )
 
 
 class TestAnalyzer(unittest.TestCase):
     def test_analyze_and_seed(self):
         analysis = {
-            "genre": "校园", "tone": "冷峻第三人称",
+            "genre": "校园",
+            "tone": "冷峻第三人称",
             "style_guide": "保持克制",
-            "characters": [{"source": "綾小路", "target": "绫小路",
-                            "gender": "男", "reading": "あやのこうじ", "note": "第一人称用俺"}],
-            "terms": [{"source": "高度育成高校", "target": "高度育成高中", "type": "组织"}],
+            "characters": [
+                {
+                    "source": "綾小路",
+                    "target": "绫小路",
+                    "gender": "male",
+                    "reading": "あやのこうじ",
+                    "note": "第一人称用俺",
+                }
+            ],
+            "terms": [{"source": "高度育成高校", "target": "高度育成高中", "type": "organization"}],
         }
         client = FakeClient(handler=lambda m, t, j: json.dumps(analysis, ensure_ascii=False))
         a = Analyzer(client, _cfg())
@@ -51,49 +59,84 @@ class TestAnalyzer(unittest.TestCase):
             store = GlossaryStore(os.path.join(d, "g.db"))
             n = a.seed_glossary(store, result)
             self.assertEqual(n, 2)
-            self.assertEqual(store.get_term("綾小路").gender, "男")
-            self.assertEqual(store.get_term("高度育成高校").type, "组织")
+            character = store.get_term("綾小路")
+            organization = store.get_term("高度育成高校")
+            self.assertIsNotNone(character)
+            self.assertIsNotNone(organization)
+            assert character is not None
+            assert organization is not None
+            self.assertEqual(character.gender, "male")
+            self.assertEqual(organization.type, "organization")
             store.close()
 
         brief = a.style_brief(result)
         self.assertIn("绫小路", brief)
 
-    def test_malformed_collections_and_fields_are_sanitized(self):
-        payload = {
-            "genre": ["not", "text"],
-            "characters": [
-                "not-an-object",
-                {"source": ["bad"], "target": "跳过"},
-                {"source": " Valid ", "target": " 有效 ", "gender": []},
-            ],
-            "terms": 7,
+    def test_malformed_collection_items_are_filtered(self):
+        analysis = {
+            "genre": {"unexpected": True},
+            "characters": ["bad", {"source": "綾小路", "target": "绫小路"}],
+            "terms": [1, {"source": "学校", "target": "学校", "type": {"bad": 1}}],
         }
-        analyzer = Analyzer(
-            FakeClient(handler=lambda m, t, j: json.dumps(payload)), _cfg()
-        )
-        result = analyzer.analyze("sample")
-        self.assertEqual(result["genre"], "")
-        self.assertEqual(len(result["characters"]), 2)
-        self.assertEqual(result["terms"], [])
+        client = FakeClient(handler=lambda m, t, j: json.dumps(analysis, ensure_ascii=False))
+        analyzer = Analyzer(client, _cfg())
+        result = analyzer.analyze("……样章……")
 
+        self.assertEqual(result["genre"], "")
+        self.assertEqual(len(result["characters"]), 1)
+        self.assertEqual(len(result["terms"]), 1)
         with tempfile.TemporaryDirectory() as d:
             store = GlossaryStore(os.path.join(d, "g.db"))
-            self.assertEqual(analyzer.seed_glossary(store, result), 1)
-            term = store.get_term("Valid")
-            assert term is not None
-            self.assertEqual(term.target, "有效")
-            self.assertEqual(term.gender, "")
+            self.assertEqual(analyzer.seed_glossary(store, result), 2)
+            school = store.get_term("学校")
+            self.assertIsNotNone(school)
+            assert school is not None
+            self.assertEqual(school.type, "term")
             store.close()
-        self.assertIn("有效", analyzer.style_brief(result))
 
 
 class TestExtractor(unittest.TestCase):
+    def test_existing_context_only_includes_terms_repeated_in_source_corpus(self):
+        prompts_seen: list[str] = []
+
+        def handler(messages, tier, json_mode):
+            prompts_seen.append(messages[-1]["content"])
+            return json.dumps({"terms": []}, ensure_ascii=False)
+
+        extractor = GlossaryExtractor(FakeClient(handler=handler), _cfg())
+        with tempfile.TemporaryDirectory() as d:
+            store = GlossaryStore(os.path.join(d, "g.db"))
+            store.upsert_term(GlossaryTerm(source="唯一术语", target="唯一译法"))
+            store.upsert_term(GlossaryTerm(source="重复术语", target="重复译法"))
+
+            extractor.extract_and_store(
+                store,
+                "本批原文。",
+                "本批译文。",
+                chapter=0,
+                source_corpus="唯一术语只出现一次。重复术语出现，然后重复术语再次出现。",
+            )
+
+            self.assertEqual(len(store.all_terms()), 2)
+            store.close()
+
+        self.assertEqual(len(prompts_seen), 1)
+        self.assertNotIn("唯一术语 → 唯一译法", prompts_seen[0])
+        self.assertIn("重复术语 → 重复译法", prompts_seen[0])
+
     def test_extract_and_store(self):
-        terms = {"terms": [
-            {"source": "堀北", "target": "堀北", "type": "人物", "gender": "女",
-             "aliases": ["堀北さん"]},
-            {"source": "屋上", "target": "天台", "type": "地名", "gender": "未知"},
-        ]}
+        terms = {
+            "terms": [
+                {
+                    "source": "堀北",
+                    "target": "堀北",
+                    "type": "person",
+                    "gender": "female",
+                    "aliases": ["堀北さん"],
+                },
+                {"source": "屋上", "target": "天台", "type": "place", "gender": "unknown"},
+            ]
+        }
         client = FakeClient(handler=lambda m, t, j: json.dumps(terms, ensure_ascii=False))
         ext = GlossaryExtractor(client, _cfg())
         with tempfile.TemporaryDirectory() as d:
@@ -101,406 +144,169 @@ class TestExtractor(unittest.TestCase):
             summary = ext.extract_and_store(store, "原文", "译文", chapter=1)
             self.assertEqual(summary["inserted"], 2)
             horikita = store.get_term("堀北")
-            self.assertEqual(horikita.gender, "女")
+            self.assertIsNotNone(horikita)
+            assert horikita is not None
+            self.assertEqual(horikita.gender, "female")
             self.assertEqual(horikita.aliases, ["堀北さん"])
             self.assertEqual(horikita.first_chapter, 1)
-            # "未知" 应被规整为空
-            self.assertEqual(store.get_term("屋上").gender, "")
+            # Normalize unknown gender to an empty value.
+            rooftop = store.get_term("屋上")
+            self.assertIsNotNone(rooftop)
+            assert rooftop is not None
+            self.assertEqual(rooftop.gender, "")
             store.close()
 
-    def test_extract_and_store_normalizes_non_string_optional_fields(self):
-        malformed_values = [
-            ("list", ["unexpected"]),
-            ("dict", {"unexpected": "value"}),
-            ("null", None),
-            ("number", 7),
-        ]
-        payload = {"terms": [
-            {
-                "source": f"source-{label}",
-                "target": f"target-{label}",
-                "reading": value,
-                "type": value,
-                "gender": value,
-                "aliases": [],
-                "note": value,
-            }
-            for label, value in malformed_values
-        ]}
-        client = FakeClient(handler=lambda m, t, j: json.dumps(payload))
-        ext = GlossaryExtractor(client, _cfg())
-
-        with tempfile.TemporaryDirectory() as d:
-            store = GlossaryStore(os.path.join(d, "g.db"))
-            summary = ext.extract_and_store(store, "source", "target", chapter=3)
-            self.assertEqual(summary["inserted"], len(malformed_values))
-            for label, _ in malformed_values:
-                with self.subTest(value_type=label):
-                    term = store.get_term(f"source-{label}")
-                    assert term is not None
-                    self.assertEqual(term.reading, "")
-                    self.assertEqual(term.type, "术语")
-                    self.assertEqual(term.gender, "")
-                    self.assertEqual(term.aliases, [])
-                    self.assertEqual(term.note, "")
-                    self.assertEqual(term.first_chapter, 3)
-            store.close()
-
-    def test_extract_normalizes_aliases(self):
-        alias_cases = [
-            ("string", "single-alias", []),
-            ("dict", {"alias": "value"}, []),
-            ("null", None, []),
-            ("number", 7, []),
-            ("mixed-list", [" alias-a ", "", None, 9, {}, "alias-b"],
-             ["alias-a", "alias-b"]),
-        ]
-        payload = {"terms": [
-            {
-                "source": f"source-{label}",
-                "target": f"target-{label}",
-                "aliases": aliases,
-            }
-            for label, aliases, _ in alias_cases
-        ]}
-        client = FakeClient(handler=lambda m, t, j: json.dumps(payload))
-        ext = GlossaryExtractor(client, _cfg())
-
-        terms = {term.source: term for term in ext.extract("source", "target", [])}
-        self.assertEqual(len(terms), len(alias_cases))
-        for label, _, expected in alias_cases:
-            with self.subTest(value_type=label):
-                self.assertEqual(terms[f"source-{label}"].aliases, expected)
-
-    def test_extract_skips_invalid_required_fields(self):
-        malformed_values = [["unexpected"], {"unexpected": "value"}, None, 7, "   "]
-        payload = {"terms": [
-            {"source": value, "target": "valid-target"}
-            for value in malformed_values
-        ] + [
-            {"source": "valid-source", "target": value}
-            for value in malformed_values
-        ] + [
-            {"source": " kept ", "target": " translated "},
-        ]}
-        client = FakeClient(handler=lambda m, t, j: json.dumps(payload))
-        ext = GlossaryExtractor(client, _cfg())
-
-        terms = ext.extract("source", "target", [])
-        self.assertEqual(len(terms), 1)
-        self.assertEqual(terms[0].source, "kept")
-        self.assertEqual(terms[0].target, "translated")
-
-    def test_strict_response_envelope_distinguishes_empty_success(self):
-        invalid = [
-            ("top-level-list", [], "response_not_object"),
-            ("missing-key", {}, "terms_missing"),
-            (
-                "extra-key",
-                {"terms": [], "extra": True},
-                "response_extra_keys",
-            ),
-            ("terms-object", {"terms": {}}, "terms_not_list"),
-            ("terms-null", {"terms": None}, "terms_not_list"),
-        ]
-        for label, payload, expected_kind in invalid:
-            with self.subTest(case=label):
-                ext = GlossaryExtractor(
-                    FakeClient(handler=lambda m, t, j, p=payload: json.dumps(p)),
-                    _cfg(),
-                )
-                with self.assertRaises(GlossaryExtractionError) as raised:
-                    ext.extract("source", "target", [])
-                self.assertEqual(raised.exception.kind, expected_kind)
-
-        ext = GlossaryExtractor(
-            FakeClient(handler=lambda m, t, j: json.dumps({"terms": []})),
-            _cfg(),
-        )
-        self.assertEqual(ext.extract("source", "target", []), [])
-
-    def test_base_prompt_overflow_does_not_call_model_or_checkpoint(self):
-        self.assertEqual(
-            extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
-            30_000,
-        )
-        client = FakeClient(
-            handler=lambda m, t, j: self.fail("oversized base prompt reached model")
-        )
-        extractor = GlossaryExtractor(client, _cfg())
-        checkpoint = GlossaryCheckpoint(
-            "chapter_window",
-            5,
-            0,
-            1,
-            "oversized-window",
-            plan_fingerprint="plan-v1",
-        )
-
-        with tempfile.TemporaryDirectory() as d:
-            store = GlossaryStore(os.path.join(d, "g.db"))
-            with self.assertRaises(GlossaryExtractionError) as raised:
-                extractor.extract_and_store(
-                    store,
-                    "oversized-source " * 2_500,
-                    "超长译文",
-                    chapter=5,
-                    checkpoint=checkpoint,
-                )
-
-            self.assertEqual(raised.exception.kind, "prompt_too_large")
-            self.assertEqual(client.calls, [])
-            self.assertFalse(store.checkpoint_matches(checkpoint))
-            self.assertEqual(store.stats()["terms"], 0)
-            store.close()
-
-    def test_refusal_with_embedded_empty_json_does_not_checkpoint(self):
-        client = FakeClient(
-            handler=lambda m, t, j: (
-                "抱歉，我不能处理这些内容。\n{\"terms\":[]}\n以上。"
-            )
-        )
-        extractor = GlossaryExtractor(client, _cfg())
-        checkpoint = GlossaryCheckpoint(
-            "chapter_window",
-            5,
-            0,
-            1,
-            "refusal-window",
-            plan_fingerprint="plan-v1",
-        )
-
-        with tempfile.TemporaryDirectory() as d:
-            store = GlossaryStore(os.path.join(d, "g.db"))
-            with self.assertRaises(GlossaryExtractionError) as raised:
-                extractor.extract_and_store(
-                    store,
-                    "source",
-                    "target",
-                    chapter=5,
-                    checkpoint=checkpoint,
-                )
-            self.assertEqual(raised.exception.kind, "model_or_json_error")
-            self.assertFalse(store.checkpoint_matches(checkpoint))
-            store.close()
-
-    def test_nonstandard_or_duplicate_json_does_not_checkpoint(self):
-        invalid = (
-            '{"terms":[NaN]}',
-            '{"terms":[],"terms":[]}',
-            '{"terms":[{"source":"a","source":"b","target":"x"}]}',
-        )
-        for index, raw in enumerate(invalid):
-            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as d:
-                client = FakeClient(handler=lambda m, t, j, value=raw: value)
-                extractor = GlossaryExtractor(client, _cfg())
-                checkpoint = GlossaryCheckpoint(
-                    "chapter_window",
-                    6,
-                    index,
-                    1,
-                    f"invalid-json-{index}",
-                    plan_fingerprint="plan-v1",
-                )
-                store = GlossaryStore(os.path.join(d, "g.db"))
-                with self.assertRaises(GlossaryExtractionError) as raised:
-                    extractor.extract_and_store(
-                        store,
-                        "source",
-                        "target",
-                        chapter=6,
-                        checkpoint=checkpoint,
-                    )
-                self.assertEqual(raised.exception.kind, "model_or_json_error")
-                self.assertFalse(store.checkpoint_matches(checkpoint))
-                store.close()
-
-    def test_rejected_candidates_do_not_write_terms_or_checkpoint(self):
-        payload = {
+    def test_malformed_optional_fields_fall_back_safely(self):
+        terms = {
             "terms": [
-                {"source": "valid", "target": "有效"},
-                42,
-                {"source": "", "target": "invalid"},
+                {
+                    "source": "term",
+                    "target": "术语",
+                    "type": {"bad": 1},
+                    "gender": ["bad"],
+                    "aliases": 1,
+                    "note": {"bad": 1},
+                }
             ]
         }
-        extractor = GlossaryExtractor(
-            FakeClient(handler=lambda m, t, j: json.dumps(payload)),
-            _cfg(),
-        )
-        checkpoint = GlossaryCheckpoint(
-            "chapter_window",
-            7,
-            0,
-            1,
-            "partially-malformed",
-            plan_fingerprint="plan-v1",
-        )
+        extractor = GlossaryExtractor(FakeClient(handler=lambda m, t, j: json.dumps(terms)), _cfg())
 
-        with tempfile.TemporaryDirectory() as d:
-            store = GlossaryStore(os.path.join(d, "g.db"))
-            with self.assertRaises(GlossaryExtractionError) as raised:
-                extractor.extract_and_store(
-                    store,
-                    "source",
-                    "target",
-                    chapter=7,
-                    checkpoint=checkpoint,
-                )
+        result = extractor.extract("term", "术语", [])
 
-            self.assertEqual(raised.exception.kind, "terms_rejected")
-            self.assertEqual(store.stats()["terms"], 0)
-            self.assertFalse(store.checkpoint_matches(checkpoint))
-            store.close()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].type, "term")
+        self.assertEqual(result[0].gender, "")
+        self.assertEqual(result[0].aliases, [])
+        self.assertEqual(result[0].note, "")
 
-    def test_reference_truncation_is_stable_and_keeps_whole_terms(self):
-        self.assertEqual(
-            extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
-            30_000,
-        )
-        sources = [f"term-{index:03d}" for index in range(240)]
-        existing = [
-            GlossaryTerm(
-                source=source,
-                target=f"译名-{index:03d}-" + "译" * 160,
-            )
-            for index, source in enumerate(sources)
-        ]
-        source_text = " ".join(sources)
-        target_text = " ".join(f"译名-{index:03d}" for index in range(len(sources)))
-        client = FakeClient(
-            handler=lambda m, t, j: json.dumps({"terms": []}, ensure_ascii=False)
-        )
-        extractor = GlossaryExtractor(client, _cfg())
-        checkpoint = GlossaryCheckpoint(
-            "chapter_window",
-            6,
-            0,
-            1,
-            "bounded-window",
-            plan_fingerprint="plan-v1",
-        )
+    def test_multiple_new_terms_use_targets_from_first_translated_occurrences(self):
+        calls: list[str] = []
 
-        system = prompts.render("glossary_extractor_system", src="ja", tgt="zh")
-        unbounded_user = prompts.render(
-            "glossary_extractor_user",
-            src="ja",
-            tgt="zh",
-            glossary=prompts.render_glossary(existing),
-            source=source_text,
-            target=target_text,
-        )
-        unbounded_messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": unbounded_user},
-        ]
-        self.assertGreater(
-            len(
-                json.dumps(
-                    unbounded_messages,
+        def handler(messages, tier, json_mode):
+            system = messages[0]["content"]
+            calls.append(system)
+            if "terminology consistency aligner" in system:
+                user = messages[-1]["content"]
+                self.assertIn("綾小路第一次走进教室。", user)
+                self.assertIn("绫小路第一次走进教室。", user)
+                self.assertIn("堀北站在窗边。", user)
+                self.assertIn('"proposed_target": "掘北"', user)
+                return json.dumps(
+                    {
+                        "terms": [
+                            {"source": "綾小路", "target": "绫小路"},
+                            {"source": "堀北", "target": "堀北"},
+                        ]
+                    },
                     ensure_ascii=False,
-                    separators=(",", ":"),
                 )
+            return json.dumps(
+                {
+                    "terms": [
+                        {"source": "綾小路", "target": "凌小路", "type": "person"},
+                        {"source": "堀北", "target": "掘北", "type": "person"},
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        extractor = GlossaryExtractor(FakeClient(handler=handler), _cfg())
+        history = [
+            TranslatedSegmentEvidence(
+                chapter=0,
+                segment=3,
+                source="綾小路第一次走进教室。",
+                target="绫小路第一次走进教室。",
             ),
-            extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
-        )
+            TranslatedSegmentEvidence(
+                chapter=0,
+                segment=4,
+                source="堀北站在窗边。",
+                target="堀北站在窗边。",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            store = GlossaryStore(os.path.join(d, "g.db"))
+            summary = extractor.extract_and_store(
+                store,
+                "后来綾小路和堀北再次出现。",
+                "后来凌小路和掘北再次出现。",
+                chapter=2,
+                history=history,
+                before=(2, 0),
+            )
+            ayanokoji = store.get_term("綾小路")
+            horikita = store.get_term("堀北")
+            self.assertIsNotNone(ayanokoji)
+            self.assertIsNotNone(horikita)
+            assert ayanokoji is not None
+            assert horikita is not None
+            self.assertEqual(ayanokoji.target, "绫小路")
+            self.assertEqual(horikita.target, "堀北")
+            self.assertEqual(ayanokoji.first_chapter, 0)
+            self.assertEqual(horikita.first_chapter, 0)
+            self.assertEqual(summary["history_matched"], 2)
+            self.assertEqual(summary["history_aligned"], 2)
+            self.assertEqual(summary["history_unresolved"], 0)
+            store.close()
+        self.assertEqual(len(calls), 2)
+
+    def test_new_term_without_prior_occurrence_is_inserted_directly(self):
+        terms = {"terms": [{"source": "綾小路", "target": "绫小路", "type": "person"}]}
+        client = FakeClient(handler=lambda m, t, j: json.dumps(terms, ensure_ascii=False))
+        extractor = GlossaryExtractor(client, _cfg())
 
         with tempfile.TemporaryDirectory() as d:
             store = GlossaryStore(os.path.join(d, "g.db"))
-            store.upsert_terms(existing, chapter=0, checkpoint=None)
-            first = extractor.extract_and_store(
+            summary = extractor.extract_and_store(
                 store,
-                source_text,
-                target_text,
-                chapter=6,
-                checkpoint=checkpoint,
+                "綾小路第一次出现。",
+                "绫小路第一次出现。",
+                chapter=0,
+                history=[],
+                before=(0, 0),
             )
-            second = extractor.extract_and_store(
-                store,
-                source_text,
-                target_text,
-                chapter=6,
-                checkpoint=checkpoint,
-            )
-
-            self.assertEqual(client.calls[0]["messages"], client.calls[1]["messages"])
-            messages = client.calls[0]["messages"]
-            serialized = json.dumps(
-                messages,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            self.assertLessEqual(
-                len(serialized),
-                extractor_module.GLOSSARY_EXTRACTOR_MAX_PROMPT_CHARS,
-            )
-            user = messages[-1]["content"]
-            self.assertIn(source_text, user)
-            self.assertIn(target_text, user)
-
-            glossary_block = user.split("【已有对照表（参考，尽量沿用其译法）】\n", 1)[
-                1
-            ].split("\n\n【原文", 1)[0]
-            selected_lines = [line for line in glossary_block.splitlines() if line]
-            all_lines = set(prompts.render_glossary(existing).splitlines())
-            self.assertGreater(len(selected_lines), 0)
-            self.assertLess(len(selected_lines), len(existing))
-            self.assertTrue(all(line in all_lines for line in selected_lines))
-            self.assertGreater(first["reference_terms_dropped"], 0)
-            self.assertEqual(
-                first["prompt_chars"],
-                len(serialized),
-            )
-            self.assertEqual(first["reference_chars"], second["reference_chars"])
-            self.assertTrue(store.checkpoint_matches(checkpoint))
+            self.assertIsNotNone(store.get_term("綾小路"))
+            self.assertEqual(summary["history_matched"], 0)
             store.close()
 
-    def test_store_extraction_prompt_uses_only_source_relevant_terms(self):
-        cfg = _cfg()
-        cfg.pipeline.glossary_scope = "full"
-        client = FakeClient(
-            handler=lambda m, t, j: json.dumps({"terms": []})
+        self.assertEqual(len(client.calls), 1)
+
+    def test_unresolved_historical_term_is_not_locked_to_later_translation(self):
+        responses = iter(
+            [
+                json.dumps(
+                    {"terms": [{"source": "綾小路", "target": "凌小路"}]},
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {"terms": [{"source": "綾小路", "target": ""}]},
+                    ensure_ascii=False,
+                ),
+            ]
         )
-        ext = GlossaryExtractor(client, cfg)
+        extractor = GlossaryExtractor(FakeClient(handler=lambda m, t, j: next(responses)), _cfg())
+        history = [
+            TranslatedSegmentEvidence(
+                chapter=0,
+                segment=0,
+                source="綾小路がいた。",
+                target="他在那里。",
+            )
+        ]
+
         with tempfile.TemporaryDirectory() as d:
             store = GlossaryStore(os.path.join(d, "g.db"))
-            store.upsert_term(GlossaryTerm(source="alpha", target="甲"))
-            store.upsert_term(
-                GlossaryTerm(
-                    source="CanonicalAlias",
-                    target="别名命中",
-                    aliases=["AliasHit"],
-                )
-            )
-            store.upsert_term(
-                GlossaryTerm(
-                    source="Appellation",
-                    target="称谓",
-                    aliases=["AliasHit"],
-                    type=TYPE_APPELLATION,
-                )
-            )
-            store.upsert_term(GlossaryTerm(source="pha", target="错误子串"))
-            store.upsert_term(GlossaryTerm(source="李", target="李"))
-            for index in range(100):
-                store.upsert_term(
-                    GlossaryTerm(source=f"noise-{index}", target=f"噪声-{index}")
-                )
-
-            summary = ext.extract_and_store(
+            summary = extractor.extract_and_store(
                 store,
-                "alpha met AliasHit. 李さん arrived.",
-                "甲遇到了别名命中。李到了。",
-                chapter=2,
+                "綾小路が戻った。",
+                "凌小路回来了。",
+                chapter=1,
+                history=history,
+                before=(1, 0),
             )
-            user = client.calls[-1]["messages"][-1]["content"]
-            self.assertIn("CanonicalAlias", user)
-            self.assertIn("alpha", user)
-            self.assertIn("李", user)
-            self.assertNotIn("Appellation", user)
-            self.assertNotIn("错误子串", user)
-            self.assertNotIn("noise-99", user)
-            self.assertEqual(summary["reference_terms_selected"], 3)
-            self.assertEqual(summary["reference_terms_total"], 105)
+            self.assertIsNone(store.get_term("綾小路"))
+            self.assertEqual(summary["history_unresolved"], 1)
             store.close()
 
 
@@ -508,16 +314,24 @@ class TestRollingContext(unittest.TestCase):
     def test_render_and_bound(self):
         ctx = RollingContext(max_recent_keep=3)
         ctx.add_targets(["a", "b", "c", "d", "e"])
-        self.assertEqual(ctx.recent_targets, ["c", "d", "e"])  # 限长
-        rendered = ctx.render(n_recent=2)  # 只取最近两段
+        self.assertEqual(ctx.recent_targets, ["c", "d", "e"])  # Bound retained context length.
+        rendered = ctx.render(n_recent=2)  # Use only the two most recent paragraphs.
         self.assertIn("d", rendered)
         self.assertIn("e", rendered)
         self.assertNotIn("c", rendered)
 
     def test_roundtrip(self):
-        ctx = RollingContext(recent_targets=["x", "y"])
+        ctx = RollingContext(recent_targets=["x", "y"], max_recent_keep=75)
         ctx2 = RollingContext.from_dict(ctx.to_dict())
         self.assertEqual(ctx2.recent_targets, ["x", "y"])
+        self.assertEqual(ctx2.max_recent_keep, 75)
+
+    def test_configured_minimum_expands_saved_context_limit(self):
+        ctx = RollingContext.from_dict(
+            {"recent_targets": [str(i) for i in range(40)]},
+            min_recent_keep=100,
+        )
+        self.assertEqual(ctx.max_recent_keep, 100)
 
 
 if __name__ == "__main__":
