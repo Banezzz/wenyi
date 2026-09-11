@@ -8,7 +8,8 @@ Running from source requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-export DEEPSEEK_API_KEY=sk-...
+export LONGCAT_API_KEY=sk-...   # this fork's sample config.yaml
+# export DEEPSEEK_API_KEY=sk-...  # with llm.preset: deepseek
 uv run trans-novel --version
 uv run trans-novel translate book.epub
 ```

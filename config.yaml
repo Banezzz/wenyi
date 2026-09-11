@@ -7,8 +7,8 @@ language:
 
 # ── LLM ──────────────────────────────────────────────────────────────────
 llm:
-  preset: deepseek # All tiers: deepseek-flash, thinking enabled, reasoning_effort high
-  # Add providers, models and routes to override individual operations.
+  preset: longcat # All tiers: LongCat-2.0; strong/cheap thinking on, fast thinking off
+  # Other presets: deepseek, gemini, fake. Add providers, models and routes to override operations.
   # Inspect effective settings with: trans-novel models list
 
 # ── Segmentation ─────────────────────────────────────────────────────────────────

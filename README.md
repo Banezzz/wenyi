@@ -90,11 +90,13 @@ uv sync
 
 ### Configuration
 
-Set your API key:
+Set your API key. This fork's sample `config.yaml` uses LongCat:
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...
+export LONGCAT_API_KEY=sk-...
 ```
+
+DeepSeek remains available with `llm.preset: deepseek` and `DEEPSEEK_API_KEY`.
 
 ### One-command translation
 

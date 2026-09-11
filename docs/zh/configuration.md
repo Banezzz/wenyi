@@ -41,7 +41,9 @@ llm:
   preset: deepseek
 ```
 
-该预设展开为连接 `default`、模型配置 `default_strong` / `default_cheap` / `default_fast`，以及三个档位映射。内置产品默认值为 `https://api.deepseek.com`、环境变量 `DEEPSEEK_API_KEY`；三个档位均使用 `deepseek-flash`，开启 thinking，`reasoning_effort` 为 `high`。模型 ID 与默认推理设置依据 [DeepSeek 官方 API 文档](https://api-docs.deepseek.com/api/create-chat-completion/)。档位保持独立映射，便于之后分别覆盖模型；预设不会自动查询远端能力。也支持 `preset: gemini` 和离线的 `preset: fake`。
+该预设展开为连接 `default`、模型配置 `default_strong` / `default_cheap` / `default_fast`，以及三个档位映射。内置产品默认值为 `https://api.deepseek.com`、环境变量 `DEEPSEEK_API_KEY`；三个档位均使用 `deepseek-flash`，开启 thinking，`reasoning_effort` 为 `high`。模型 ID 与默认推理设置依据 [DeepSeek 官方 API 文档](https://api-docs.deepseek.com/api/create-chat-completion/)。档位保持独立映射，便于之后分别覆盖模型；预设不会自动查询远端能力。也支持 `preset: longcat`、`preset: gemini` 和离线的 `preset: fake`。
+
+`preset: longcat` 使用 `https://api.longcat.chat/openai/v1`、`LONGCAT_API_KEY`，三个档位均为 `LongCat-2.0`。strong/cheap 开启 thinking，并在 `thinking.effort` 中发送 `high`；fast 关闭 thinking。本仓库样例 `config.yaml` 默认 LongCat；程序生成的缺省配置文件仍为 DeepSeek。
 
 例如，单独配置润色与取证模型：
 
@@ -84,6 +86,7 @@ llm:
 | 适配器 | 连接默认值 / 选项 | 模型选项 |
 |---|---|---|
 | `deepseek` | DeepSeek 端点；`DEEPSEEK_API_KEY` | `thinking`、`reasoning_effort`、`extra_body` |
+| `longcat` | `https://api.longcat.chat/openai/v1`；`LONGCAT_API_KEY` | `thinking`、`reasoning_effort`、`extra_body`（effort 写在 `thinking` 内） |
 | `openai` | OpenAI 端点；`OPENAI_API_KEY` | `thinking`、`reasoning_effort`、`extra_body` |
 | `openrouter` | OpenRouter 端点；`OPENROUTER_API_KEY` | `thinking`、`reasoning_effort`、`extra_body` |
 | `gemini` | 原生 Gemini API；未指定自定义变量时，从 `GEMINI_API_KEY` 回退到 `GOOGLE_API_KEY` | `thinking_level` 或 `thinking_budget`、`temperature`、`extra_body` |

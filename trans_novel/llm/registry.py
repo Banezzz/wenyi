@@ -113,6 +113,7 @@ def register_providers(specs: Iterable[ProviderSpec]) -> Mapping[str, ProviderSp
 PROVIDERS = register_providers(
     (
         ProviderSpec("deepseek", "deepseek", "DeepSeekClient", "DeepSeekOptions"),
+        ProviderSpec("longcat", "longcat", "LongCatClient", "LongCatOptions"),
         ProviderSpec("openai", "openai", "OpenAIClient", "OpenAIOptions"),
         ProviderSpec("openrouter", "openrouter", "OpenRouterClient", "OpenRouterOptions"),
         ProviderSpec(

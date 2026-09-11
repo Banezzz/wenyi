@@ -8,7 +8,8 @@
 
 ```bash
 uv sync
-export DEEPSEEK_API_KEY=sk-...
+export LONGCAT_API_KEY=sk-...   # 本 fork 样例 config.yaml
+# export DEEPSEEK_API_KEY=sk-...  # 配合 llm.preset: deepseek
 uv run trans-novel --version
 uv run trans-novel translate book.epub
 ```

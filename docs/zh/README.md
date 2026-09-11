@@ -90,11 +90,13 @@ uv sync
 
 ### 配置
 
-设置 API 密钥：
+设置 API 密钥。本 fork 的样例 `config.yaml` 使用 LongCat：
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...
+export LONGCAT_API_KEY=sk-...
 ```
+
+如需 DeepSeek，设置 `llm.preset: deepseek` 并导出 `DEEPSEEK_API_KEY`。
 
 ### 一键翻译
 

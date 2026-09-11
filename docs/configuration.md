@@ -41,7 +41,9 @@ llm:
   preset: deepseek
 ```
 
-This preset expands to connection `default`, profiles `default_strong`, `default_cheap`, and `default_fast`, and all three tier mappings. Its product defaults are `https://api.deepseek.com`, `DEEPSEEK_API_KEY`, `deepseek-flash` for all three tiers, with thinking enabled and `reasoning_effort: high`. The model ID and reasoning defaults follow the [DeepSeek API documentation](https://api-docs.deepseek.com/api/create-chat-completion/). The tiers retain independent mappings for later overrides; presets do not query remote capabilities. `preset: gemini` and `preset: fake` are also available; fake is offline.
+This preset expands to connection `default`, profiles `default_strong`, `default_cheap`, and `default_fast`, and all three tier mappings. Its product defaults are `https://api.deepseek.com`, `DEEPSEEK_API_KEY`, `deepseek-flash` for all three tiers, with thinking enabled and `reasoning_effort: high`. The model ID and reasoning defaults follow the [DeepSeek API documentation](https://api-docs.deepseek.com/api/create-chat-completion/). The tiers retain independent mappings for later overrides; presets do not query remote capabilities. `preset: longcat`, `preset: gemini` and `preset: fake` are also available; fake is offline.
+
+`preset: longcat` uses `https://api.longcat.chat/openai/v1`, `LONGCAT_API_KEY`, and `LongCat-2.0` for all three tiers. Strong and cheap enable thinking with nested `effort: high`; fast disables thinking. This repository's sample `config.yaml` uses LongCat; a generated default file still uses DeepSeek.
 
 For independent polishing and evidence verification:
 
@@ -84,6 +86,7 @@ Replace `YOUR_EDITOR_MODEL` with a model supported by your endpoint. Other opera
 | Adapter kinds | Connection defaults / options | Model options |
 |---|---|---|
 | `deepseek` | DeepSeek endpoint; `DEEPSEEK_API_KEY` | `thinking`, `reasoning_effort`, `extra_body` |
+| `longcat` | `https://api.longcat.chat/openai/v1`; `LONGCAT_API_KEY` | `thinking`, `reasoning_effort`, `extra_body` (effort is sent inside `thinking`) |
 | `openai` | OpenAI endpoint; `OPENAI_API_KEY` | `thinking`, `reasoning_effort`, `extra_body` |
 | `openrouter` | OpenRouter endpoint; `OPENROUTER_API_KEY` | `thinking`, `reasoning_effort`, `extra_body` |
 | `gemini` | Native Gemini API; `GEMINI_API_KEY`, falling back to `GOOGLE_API_KEY` when no custom variable is set | `thinking_level` or `thinking_budget`, `temperature`, `extra_body` |

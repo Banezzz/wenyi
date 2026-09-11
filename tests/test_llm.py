@@ -163,6 +163,45 @@ class TestProviderRequestKwargs(unittest.TestCase):
             {"thinking": {"type": "disabled"}},
         )
 
+    def test_longcat_dialect_nests_effort_inside_thinking(self):
+        from trans_novel.llm.providers.longcat import (
+            LongCatOptions,
+            build_request_kwargs,
+            preset_models,
+        )
+        from trans_novel.llm.transport import ResolvedModel
+
+        tier = ResolvedModel(
+            model="m",
+            options=LongCatOptions(
+                extra_body={"thinking": {"budget": 8192}},
+            ),
+        )
+        kwargs = build_request_kwargs(tier, self.messages)
+
+        self.assertNotIn("reasoning_effort", kwargs)
+        self.assertEqual(
+            kwargs["extra_body"],
+            {"thinking": {"type": "enabled", "effort": "high", "budget": 8192}},
+        )
+
+        disabled = ResolvedModel(
+            model="m",
+            options=LongCatOptions(thinking=False),
+        )
+        disabled_kwargs = build_request_kwargs(disabled, self.messages)
+        self.assertNotIn("reasoning_effort", disabled_kwargs)
+        self.assertEqual(
+            disabled_kwargs["extra_body"],
+            {"thinking": {"type": "disabled"}},
+        )
+
+        presets = preset_models()
+        self.assertEqual(presets["strong"].model, "LongCat-2.0")
+        self.assertTrue(presets["strong"].options.thinking)
+        self.assertTrue(presets["cheap"].options.thinking)
+        self.assertFalse(presets["fast"].options.thinking)
+
     def test_openrouter_dialect_and_explicit_disable(self):
         from trans_novel.llm.providers.openrouter import (
             OpenRouterOptions,
@@ -375,6 +414,7 @@ class TestProviderFactory(unittest.TestCase):
 
     def test_builds_each_provider_from_its_own_module(self):
         from trans_novel.llm.factory import build_client
+        from trans_novel.llm.providers.longcat import LongCatClient
         from trans_novel.llm.providers.ollama import OllamaClient
         from trans_novel.llm.providers.openai import OpenAIClient
         from trans_novel.llm.providers.openai_compatible import (
@@ -388,6 +428,7 @@ class TestProviderFactory(unittest.TestCase):
             ("openai", OpenAIClient, None),
             ("openrouter", OpenRouterClient, None),
             ("orcarouter", OrcaRouterClient, None),
+            ("longcat", LongCatClient, None),
             ("openai-compatible", OpenAICompatibleClient, "https://example.test/v1"),
             ("ollama", OllamaClient, None),
             ("vllm", VLLMClient, None),
@@ -398,6 +439,22 @@ class TestProviderFactory(unittest.TestCase):
                     build_client(self._config(provider, base_url=base_url)).adapter("default"),
                     expected_type,
                 )
+
+    def test_longcat_defaults_and_api_key_validation(self):
+        from trans_novel.llm.factory import build_client
+        from trans_novel.llm.providers.longcat import LongCatClient
+
+        client = build_client(self._config("longcat"))
+        assert isinstance(client.adapter("default"), LongCatClient)
+
+        self.assertEqual(client.adapter("default").base_url, "https://api.longcat.chat/openai/v1")
+        self.assertEqual(client.adapter("default").api_key_env, "LONGCAT_API_KEY")
+        self.assertTrue(client.adapter("default").requires_api_key)
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "LONGCAT_API_KEY"):
+                client.validate_credentials()
+        with patch.dict(os.environ, {"LONGCAT_API_KEY": "secret"}, clear=True):
+            client.validate_credentials()
 
     def test_orcarouter_defaults_and_api_key_validation(self):
         from trans_novel.llm.factory import build_client
