@@ -75,11 +75,11 @@ pipeline:
   review_clean_confirmations: 2 # Require two consecutive clean rounds to accept the shadow translation
   review_autofix: true # Publish review revisions to formal chapters; use --no-autofix for recommendations only
   glossary_scope: chapter # chapter=terms occurring in this chapter (saves tokens); full=entire glossary
-  # PDF backend: mineru (default, supports scans) | babeldoc (optional, preserves layout via external AGPL HTTP bridge)
-  pdf_backend: mineru
+  # PDF backend: babeldoc preserves native-PDF layout/images/notes via HTTP bridge
+  pdf_backend: babeldoc
   babeldoc_bridge_url: http://127.0.0.1:8765
   # babeldoc_pages: "15"   # Optional page restriction for the bridge (one-based)
-  babeldoc_timeout: 600
+  babeldoc_timeout: 1800
 
 # ── Honorific strategy (language-specific rules apply where available)────────────────────
 honorific:
