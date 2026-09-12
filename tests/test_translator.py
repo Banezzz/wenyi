@@ -289,6 +289,30 @@ class TestTranslatorAnnotationContexts(unittest.TestCase):
             ],
         )
 
+    def test_content_inspection_splits_to_single_paragraphs(self):
+        from trans_novel.agents.translator import is_content_policy_error
+
+        self.assertTrue(
+            is_content_policy_error(
+                RuntimeError(
+                    "Error code: 400 - {'error': {'code': 'data_inspection_failed', "
+                    "'message': 'Output data may contain inappropriate content.'}}"
+                )
+            )
+        )
+
+        def handler(messages, tier, json_mode):
+            n = _count_segments(messages[-1]["content"])
+            if n > 1:
+                raise RuntimeError(
+                    "Error code: 400 - {'error': {'code': 'data_inspection_failed', "
+                    "'message': 'Output data may contain inappropriate content.'}}"
+                )
+            return json.dumps({"translations": [f"译{i}" for i in range(n)]}, ensure_ascii=False)
+
+        translator = Translator(FakeClient(handler=handler), self._config())
+        self.assertEqual(translator.translate_batch(["第一段", "第二段"]), ["译0", "译0"])
+
 
 if __name__ == "__main__":
     unittest.main()

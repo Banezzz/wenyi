@@ -19,6 +19,21 @@ class AlignmentError(Exception):
     pass
 
 
+def is_content_policy_error(error: BaseException) -> bool:
+    """True when a provider refused the request or output for content inspection."""
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "data_inspection_failed",
+            "inappropriate content",
+            "content_filter",
+            "content policy",
+            "content inspection",
+        )
+    )
+
+
 class Translator(Agent):
     @staticmethod
     def _needs_translation(source: str) -> bool:
@@ -116,6 +131,12 @@ class Translator(Agent):
             raise AlignmentError(
                 "Cannot parse the translation JSON returned by the model"
             ) from error
+        except Exception as error:
+            if is_content_policy_error(error):
+                raise AlignmentError(
+                    "Provider content inspection rejected this translation batch"
+                ) from error
+            raise
         if not isinstance(items, list):
             raise AlignmentError("The model did not return a translation array")
         if len(items) != n:
@@ -192,8 +213,11 @@ class Translator(Agent):
                 for index, target in zip(translated_indices, translated):
                     targets[index] = target
                 return targets
-            except AlignmentError:
+            except AlignmentError as error:
                 # Recover only output protocol/alignment errors; the provider handles transport retries.
+                # Content inspection on a large batch is unlikely to succeed on retry; split now.
+                if is_content_policy_error(error) or "content inspection" in str(error).lower():
+                    break
                 continue
 
         # Fall back to individual paragraphs. If any still fails, stop explicitly and preserve saved
@@ -215,6 +239,23 @@ class Translator(Agent):
                     annotation_context,
                 )
             except Exception as error:
+                policy = is_content_policy_error(error) or "content inspection" in str(
+                    error
+                ).lower()
+                if policy:
+                    try:
+                        targets[index] = self._translate_one(
+                            source, [], "", "", "", "", []
+                        )
+                        continue
+                    except Exception as stripped_error:
+                        if is_content_policy_error(
+                            stripped_error
+                        ) or "content inspection" in str(stripped_error).lower():
+                            # Keep the source so resume can skip this paragraph and finish the book.
+                            targets[index] = source
+                            continue
+                        error = stripped_error
                 raise AlignmentError(
                     f"Single-paragraph fallback failed at paragraph {index}"
                 ) from error
